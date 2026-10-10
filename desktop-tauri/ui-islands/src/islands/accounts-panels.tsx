@@ -336,11 +336,17 @@ function pendingPlans(entry: UsageEntry): Array<Record<string, unknown>> {
     && String((item as Record<string, unknown>).state || '') === 'pending') as Array<Record<string, unknown>>
 }
 
-/** 待生效套餐的悬停说明：逐份列「名字（生效时间）」——时间可能在读数里缺失，那就只说名字 */
+/**
+ * 待生效套餐的悬停说明：逐份列「名字（生效时间）」——时间可能在读数里缺失，那就只说名字。
+ *
+ * 用后端的 `pendingUntil`（最早一条还没到点的**权益生效时间**，口径见后端
+ * `plan_effective_times`）；它缺失时才退回 `startsAt`（那是领取时间，只在没有
+ * 权益的套餐上才等于生效时间）。
+ */
 function pendingPlansTitle(plans: Array<Record<string, unknown>>): string {
   const lines = plans.map(plan => {
     const name = String(plan.name || plan.planId || t('套餐'))
-    const starts = Number(plan.startsAt)
+    const starts = Number(plan.pendingUntil ?? plan.startsAt)
     return Number.isFinite(starts) && starts > 0
       ? t('{name}（{time} 起生效）', { name, time: formatTime(starts * 1000) })
       : name
@@ -387,13 +393,22 @@ function usageSummary(entry: UsageEntry): { text: string; kind: string; title: s
         + `${wallet?.balanceView ? String(wallet.balanceView) : numberText(wallet?.balance)}`)
       .join(' · ')
     const subscription = subscriptionText(data.subscription)
-    // ── 「没有额度桶、但有套餐」要说明口径 ───────────────────────
-    // 这种账号（额度记在活动套餐那条通道上）在余额列里显示的是套餐的**权益额度**
-    // （发放额），不是剩余量 —— 不说明就会被读成「还剩 3 亿」。判据是结构而不是
-    // 文案（`wallets` 空 + `plans` 非空），与 `usagePool` 的兜底分支同一口径。
-    const grantNote = wallets.length === 0 && Array.isArray(data.plans) && data.plans.length > 0
-      ? [t('上游的余额读数里没有这个套餐的额度桶，剩余量读不到；余额列显示的是套餐发放的权益额度，不是剩余量')]
-      : []
+    // ── 没有额度桶时的口径说明（两档，判据都是**结构**不是文案）───────
+    // 这种账号（额度记在活动套餐那条通道上）余额列会退回套餐权益：权益里带着
+    // 已用/总量就画真条，只有发放额就报「权益 x」不画条 —— 两种情况都要说明，
+    // 否则「权益 3亿 token」会被读成「还剩 3 亿」。
+    // 另外：额度窗口若是从开放平台监控通道补来的（`walletsFrom`），也要说一句
+    // ——那是**另一条通道**的口径（每 N 小时 / 每周的剩余比例），与套餐到期无关。
+    const notes: string[] = []
+    if (wallets.length === 0 && Array.isArray(data.plans) && data.plans.length > 0) {
+      const plan = leadPlan(data)
+      notes.push(plan && grantUsage(plan)
+        ? t('读数里没有额度桶，这里按套餐权益里的已用 / 总量显示（上游给的数）')
+        : t('上游的余额读数里没有这个套餐的额度桶，剩余量读不到；余额列显示的是套餐发放的权益额度，不是剩余量'))
+    }
+    if (String(data.walletsFrom || '') === 'monitor') {
+      notes.push(t('额度窗口读数来自开放平台监控通道（套餐 JWT 那条通道没有额度桶）：读的是每 N 小时 / 每周窗口的剩余比例'))
+    }
     // 展示串优先：ZCode 的额度单位是 token（1 亿 = 9 位数字），而余额列只有几十
     // 像素宽 —— 后端因此给了 `availableView`（`1亿 token` 这类紧凑串）。没有这个
     // 字段的家（其余全部）走的仍是「数值 + 单位」那条老路，行为一字未变。
@@ -422,7 +437,7 @@ function usageSummary(entry: UsageEntry): { text: string; kind: string; title: s
     return {
       text: available + (missing.length ? ' ⚠' : ''),
       kind: missing.length ? 'warn' : 'ok',
-      title: [available, detail, subscription, ...grantNote, ...absent, ...missing].filter(Boolean).join(' · '),
+      title: [available, detail, subscription, ...notes, ...absent, ...missing].filter(Boolean).join(' · '),
     }
   }
   return { text: t('无数据'), kind: 'muted', title: t('未返回可识别的余额数据') }
@@ -461,22 +476,49 @@ function biggestGrant(plan: Record<string, unknown>): { units: number; unit: str
 }
 
 /**
+ * 套餐权益里**能算比例**的用量（`{used, total, unit}`；给不出时 null）。
+ *
+ * 上游并不一定给（`used_units` / `total_units` / `remaining_units` 都是可选键，
+ * 后端原样带出来，缺失是 null）—— 给了就画一条真进度条，没给就退回「权益额度」
+ * 那种干读数（见 `usagePool` 的兜底分支）。取**第一笔总量为正**的权益：
+ * 多笔权益各画各的条是明细弹窗的事，这一列只回答「主额度还剩多少」。
+ */
+function grantUsage(plan: Record<string, unknown>): { used: number; total: number; unit: string } | null {
+  const items = Array.isArray(plan.entitlements) ? plan.entitlements as Array<Record<string, unknown>> : []
+  for (const item of items) {
+    const total = numberOrNull(item?.totalUnits)
+    if (total === null || total <= 0) continue
+    const used = numberOrNull(item?.usedUnits)
+    const remaining = numberOrNull(item?.remainingUnits)
+    const usedValue = used === null
+      ? (remaining === null ? null : Math.max(0, total - remaining))
+      : used
+    if (usedValue === null) continue
+    return { used: usedValue, total, unit: String(item?.unitType || '').trim() }
+  }
+  return null
+}
+
+/**
  * 余额里的「主额度桶」：界面用它画套餐名与进度条（`UsageCell` 的两行形态）。
+ *
+ * ── 三档取值（按「能画出什么」排）────────────────────────────
+ *   ① **有总量的桶**里取总量最大的那个（现状）；
+ *   ② 一个「有总量」的都没有时，取**只有比例**的窗口里剩余最少（最紧张）的那个
+ *      —— 监控通道那条链回的常是纯比例（2026-02 起上游大多不再给绝对量，
+ *      见后端 `monitor.rs`），而这一列问的是「还够不够用」，最紧张的那个才是答案；
+ *   ③ 连比例都没有（活动套餐的额度不落在任何桶里）时，退回套餐的权益：
+ *      权益里带着已用/总量就画**真**进度条（读数「剩 x / y」），只有发放额
+ *      就只报「权益 x」并且**不画条** —— 那是发放额不是剩余量，画一条满格的
+ *      条会被读成「还剩这么多」。
+ * 三档都取不到（免费账号没领过）返回 null，那一列显示「无额度」是对的。
  *
  * ── 为什么取「总量最大的那个桶」──────────────────────────────
  * 一个账号常常同时挂着好几份额度：活动发的大额包（ZCode Trust Build 的 1 亿）
  * 与每天续发的小额包（Start Plan 的 300 万）。用户点开这一列想看的是**大额那份**
  * 还剩多少，而「总量最大」正是它 —— 也顺带避开了每日桶在一天之内反复回满
- * 导致进度条乱跳。总量缺一个都不参与比较（没有总量就画不出进度），
+ * 导致进度条乱跳。总量缺一个都不参与这一档的比较（没有总量就画不出「用了多少」），
  * 于是没有结构化验数据的家（其余全部）自然退回上面那套纯读数呈现。
- *
- * ── 没有额度桶时退回「套餐权益」（`plans` 的兜底形态）──────────
- * 有的账号读数里**一个桶都没有**（额度记在活动套餐那条通道上），但名下挂着套餐
- * —— 旧实现只认桶，于是「刚领到套餐」的账号在余额列里仍是一片「无额度」，
- * 而账号页恰恰是用户确认「领到了没」的地方。这里退回代表套餐的权益额度：
- * 那是**发放额**不是剩余量，所以读数前标明「权益」、**不画进度条**
- * （`percent: null`，画一条满格的条会被读成「还剩这么多」）。
- * 没有套餐也没有桶（免费账号没领过）仍然返回 null —— 那种情况「无额度」是对的。
  *
  * ── 缺失一律当「不知道」─────────────────────────────────────
  * `remainingPercent` 缺失时**不画进度条**（但名字与读数照给），
@@ -497,15 +539,51 @@ function usagePool(entry: UsageEntry): { planName: string; text: string; percent
     ? data.subscription
     : {}) as Record<string, unknown>
   if (!lead) {
+    // ② 只有比例的窗口（监控通道）：取剩余最少的那个
+    let tightest: { wallet: Record<string, unknown>; percent: number } | null = null
+    for (const wallet of wallets) {
+      const percent = numberOrNull(wallet?.remainingPercent)
+      if (percent === null) continue
+      if (!tightest || percent < tightest.percent) tightest = { wallet, percent }
+    }
+    if (tightest) {
+      const percent = Math.max(0, Math.min(100, tightest.percent))
+      // 单元格只要**前半句**：监控通道的展示串是「剩 72% · 10-11 03:00 重置」，
+      // 重置时刻那一半在悬停提示里（`usageSummary` 的 detail 用完整串）——
+      // 这一格只有几十像素宽，塞进去会把列挤变形。分隔符「 · 」是后端
+      // `monitor::wallet_view` 拼的（那两段之间唯一的那个），前面那段就是读数。
+      const view = String(tightest.wallet.balanceView || '').split(' · ')[0].trim()
+      return {
+        planName: String(tightest.wallet.planName || subscription.planName || ''),
+        text: view || t('剩余 {percent}%', { percent: Math.round(percent) }),
+        percent,
+      }
+    }
+    // ③ 连比例都没有：退回套餐权益（有已用/总量就画真条，只有发放额就只报数）
     const plan = leadPlan(data)
-    const grant = plan ? biggestGrant(plan) : null
-    if (!plan || !grant) return null
+    if (!plan) return null
+    const usage = grantUsage(plan)
+    const planName = String(plan.name || plan.planId || subscription.planName || '')
+    if (usage) {
+      const remaining = Math.max(0, usage.total - usage.used)
+      return {
+        planName,
+        text: t('剩 {left} / {total}{unit}', {
+          left: compactNumber(remaining),
+          total: compactNumber(usage.total),
+          unit: usage.unit ? ` ${usage.unit}` : '',
+        }),
+        percent: Math.max(0, Math.min(100, (remaining / usage.total) * 100)),
+      }
+    }
+    const grant = biggestGrant(plan)
+    if (!grant) return null
     return {
-      planName: String(plan.name || plan.planId || subscription.planName || ''),
+      planName,
       text: grant.unit
         ? t('权益 {value} {unit}', { value: compactNumber(grant.units), unit: grant.unit })
         : t('权益 {value}', { value: compactNumber(grant.units) }),
-      // 权益额度不是剩余量：不画条（口径见上面那段）
+      // 权益额度不是剩余量：不画条（口径见上面那段文档）
       percent: null,
     }
   }

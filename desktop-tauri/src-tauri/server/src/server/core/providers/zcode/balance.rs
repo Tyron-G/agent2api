@@ -39,14 +39,23 @@
 //! `used_units` / `reserved_units` / `remaining_units` / `available_units` /
 //! `period_start` / `period_end` / `expires_at`）。
 //! 三处**官方语义**一并移植，别当成优化去掉：
-//!   1. 套餐状态**按时间判**（`ends_at` 已过 → `expired`；生效时间还没到 →
+//!   1. 套餐状态**按时间判**（`ends_at` 已过 → `expired`；**生效时间还没到** →
 //!      `pending`），`status` 只当兜底 —— 上游偶尔不刷状态，照直读会让过期套餐
 //!      一直显示在身边；反过来只认 `status` 字面值又会让**刚领到、还没到生效
 //!      时间**的活动套餐整条消失。三态与判法见 `plan_state`；
-//!   2. 现在还不能用的套餐（待生效 / 已过期 / 状态未知）名下的余额桶**整条丢掉**
-//!      （`user_plan_id` 优先、退回 `plan_id` 配对）—— 否则「昨天领的 1 亿」会永远
-//!      挂在那里，而「今天 23:00 才生效的 1 亿」会提前冒充可用额度；
+//!   2. 现在还不能用的套餐（已过期 / 权益**全都**还没到生效时间）名下的余额桶
+//!      **整条丢掉**（`user_plan_id` 优先、退回 `plan_id` 配对）—— 否则
+//!      「昨天领的 1 亿」会永远挂在那里，而「今天 23:00 才生效的 1 亿」会提前
+//!      冒充可用额度；
 //!   3. 认不出归属的桶**保留**（宁可在读数里多一行，也不误删另一个有效套餐的余额）。
+//!
+//! ── 「生效时间」读哪儿（2026-10-10 按官方源码对齐）────────────
+//! 生效时间挂在**权益**上（`entitlements[].effective_at`，unix 秒；`0` = 立即生效
+//! 哨兵）。套餐级 `starts_at` 是**领取 / 购买时间**，只在没有权益时兜底 —— 早期
+//! 实现拿它当生效时间，于是界面上把「领取那一刻」显示成了生效时间（官方客户端
+//! 同一份套餐显示的是「待生效 今天 23:00」）。判「到点没有」的基准是上游的
+//! `server_time`（官方 availability 同样用服务端时间，不用本机时钟）。细则与
+//! 出处见 `plan_effective_times` / `pending_until` / `all_pending`。
 //!
 //! ── 输出里的 `plans` 数组（界面「套餐明细」用）────────────────
 //! 归一化结果里除了 `wallets`（可用读数）还多一段 `plans`：名下**全部**套餐及其
@@ -158,7 +167,45 @@ pub(super) async fn query_usage(
         // 「只粘了 API Key」的账号因此不会为一次查询平白落一条设备标识。
         let device_mid = store.zcode_device_mid_or_create(&account_id_owned);
         match billing_channel(region, &jwt, device_mid.as_deref(), proxy.as_ref()).await {
-            Ok(value) => return Ok(value),
+            Ok(value) => {
+                // ── 「有套餐、但一个额度桶都没有」时补一条监控通道的窗口读数 ──
+                // 活动套餐（start-plan）的额度不落在 billing 的桶里：2026-10-10 实测
+                // 一份「生效中、3 亿 token」的套餐，`balances` 是空的 —— 界面上只剩
+                // 一个「权益 3亿 token」的干读数，**连进度条都画不出来**（列宽那一格
+                // 的进度条要的是比例）。开放平台的监控通道对同一把账号回的是
+                // **窗口限额与剩余比例**（每 N 小时 / 每周），那正是画条要的东西。
+                //
+                // 只在 billing 一个桶都没读到、且账号有编码套餐 API Key 时合并：
+                // 有桶就说明 billing 那侧是权威读数，硬塞一份监控通道的窗口只会让
+                // 两套口径混在同一列里。合并的只有 `wallets` / `availableView`
+                // （这两样本来就描述「这一列显示什么」），**不动** `plans` /
+                // `subscription` / `available`（套餐清单与到期仍只认 billing；
+                // `available` 保持 null，见它那段注释 —— 窗口比例不是余额数字，
+                // 不该参与「余额不足就跳过」的判定）。
+                //
+                // 代价是这类账号每次余额查询会多打一次监控接口；它们本来就只有
+                // 一次 billing 调用（且回的是空），换来的是一条能画条的读数。
+                if !has_wallets(&value) && !coding_key.is_empty() {
+                    match super::monitor::query(region, &coding_key, proxy.as_ref()).await {
+                        Ok(windows) if has_wallets(&windows) => {
+                            return Ok(merge_monitor_windows(value, windows))
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            logging::verbose(
+                                "[Usage]",
+                                &format!(
+                                    "ZCode {}账号 {account_id_owned} 的套餐令牌通道没有额度桶，\
+                                     监控通道也没读到读数（{}）",
+                                    region.label(),
+                                    error.message
+                                ),
+                            );
+                        }
+                    }
+                }
+                return Ok(value);
+            }
             Err(error) => {
                 logging::verbose(
                     "[Usage]",
@@ -315,10 +362,14 @@ fn normalize(data: &Value) -> Value {
     // （官方客户端显示「待生效 今天 23:00」的那种：生效时间在未来）被整条丢掉，
     // 界面上表现为「领取成功但看不到套餐」。现在按时间判，并把它原样带出去。
     let state_of = |plan: &Value| -> PlanState { plan_state(plan, now) };
-    // 「这份套餐的权益现在能不能用」：只有生效中才算 —— 待生效/已过期/状态未知
-    // 都不把它的额度桶计进可用读数与合计（宁可不显示，也不拿还不能用的额度
-    // 当可用 —— 后者会让用户以为额度已经到账，也会让余额跳过档少拦一个账号）
-    let usable = |plan: &Value| -> bool { state_of(plan) == PlanState::Active };
+    // 「这份套餐的额度现在能不能用」：已过期的不能；**权益全都还没到生效时间**的
+    // 也不能（3 亿还没到点就冒充可用额度，会让用户以为额度已经到账，也会让
+    // 余额跳过档少拦一个账号）。其余一律算能用 —— 包括「状态字符串认不出来」的：
+    // 那是我们识别能力的边界，不该变成用户的额度凭空消失
+    // （旧实现把非 active 一律当过期，正是那一类 bug 的来源）。
+    let usable = |plan: &Value| -> bool {
+        state_of(plan) != PlanState::Expired && !all_pending(plan, now)
+    };
     // 桶的归属：`user_plan_id` 优先、退回 `plan_id`（官方同款配对规则）
     let owners_of = |bucket: &Value| -> Vec<&Value> {
         let user_plan_id = bucket.get("user_plan_id").and_then(Value::as_str);
@@ -474,6 +525,10 @@ fn normalize(data: &Value) -> Value {
                 // 缺失一律 null（界面按「不知道」处理，不拿 0 冒充）
                 "startsAt": plan_bound(plan, START_KEYS).filter(|value| *value > 0.0).map(|value| value as i64),
                 "endsAt": plan_bound(plan, END_KEYS).filter(|value| *value > 0.0).map(|value| value as i64),
+                // 待生效时刻（**最早的、还没到的**生效时间；unix 秒）。界面靠它写
+                // 「待生效 今天 23:00」—— 与 `startsAt`（领取时间，官方把它当
+                // `beginTime`）**不是一回事**，别拿后者顶替（见 `plan_effective_times`）
+                "pendingUntil": pending_until(plan, now).map(|value| value as i64),
                 "entitlements": entitlements_of(plan),
             })
         })
@@ -555,21 +610,26 @@ const END_KEYS: &[&str] = &["ends_at", "end_at", "endsAt", "endAt", "expire_at",
 /// 旧实现只看 `status`：不是 `"active"` 字面值就判过期。而**刚领到的活动套餐**
 /// 在生效时间之前常常不是这个字面值（或者虽是 active、但生效时间在未来）——
 /// 于是那次领取被归一化整条丢掉：用户在官方客户端看到「待生效 今天 23:00」，
-/// 在我们界面上什么都看不到。这是这次改动的起源。
+/// 在我们界面上什么都看不到。
 ///
-/// 认不出来时给 [`PlanState::Unknown`] 而不是 Active，与旧实现的保守取向一致
-/// （不能拿一份没证实可用的额度当可用，见 `normalize` 里 `usable` 那段）；
-/// 界面上它与「待生效」一样不计入可用读数，只是文案更诚实。
+/// ── 生效时间读哪儿（口径照抄官方客户端）────────────────────────
+/// 见 [`plan_effective_times`]：挂在**权益**上的 `effective_at`，套餐级
+/// `starts_at` 只在没有权益时兜底 —— 后者是**领取 / 购买时间**，把它当生效时间
+/// 就会显示成「领取那刻就生效」（2026-10-10 实测的那个 bug）。
+///
+/// 认不出来时给 [`PlanState::Unknown`] 而不是 Active：状态字符串认不出是**我们
+/// 识别能力**的问题，不该让额度跟着消失（额度桶的取舍见 `normalize` 里的
+/// `usable`）—— 这里只影响徽章上写哪三个字。
 fn plan_state(plan: &Value, now: f64) -> PlanState {
-    if let Some(starts_at) = plan_bound(plan, START_KEYS).filter(|value| *value > 0.0) {
-        if starts_at > now {
-            return PlanState::Pending;
-        }
-    }
+    // 结束时间已过就是过期（官方同款：`status: active` 但 `ends_at` 过了 → expired）
     if let Some(ends_at) = plan_bound(plan, END_KEYS).filter(|value| *value > 0.0) {
         if ends_at <= now {
             return PlanState::Expired;
         }
+    }
+    // 还有没到点的权益 → 待生效（官方 UI 口径：只要有一条未来就标「待生效」）
+    if pending_until(plan, now).is_some() {
+        return PlanState::Pending;
     }
     match plan
         .get("status")
@@ -584,6 +644,56 @@ fn plan_state(plan: &Value, now: f64) -> PlanState {
         // 缺失 / 空串 / 认不出的取值（`paused`、`pending` 之类）：不知道，别猜
         _ => PlanState::Unknown,
     }
+}
+
+/// 这份套餐已知的**生效时刻**（unix 秒）。
+///
+/// ── 口径照抄官方客户端（两处实现交叉验证过）──────────────────
+///   · 首要来源是**权益**上的 `entitlements[].effective_at`
+///     （`codingPlanProviderAvailability.ts` 的 `plan.entitlements.map(e => e.effective_at)`；
+///     界面侧 `CodingPlanStatusMeta` 读同一份，显示成「待生效 {date}」）；
+///   · **没有权益**时才退回套餐级 `starts_at`（官方同一条兜底：
+///     `plan.entitlements?.length ? … : [plan.starts_at]`）。`starts_at` 是领取 /
+///     购买时间（官方 usage-stats 把它映射成 `beginTime`），官方卡片从不拿它当
+///     生效时间展示。
+///
+/// `effective_at = 0` 是**立即生效**的哨兵值（官方注释：投影成 Unix Epoch，
+/// 不属于排期权益），所以只收 `> 0` 的；形态是 `number | string | null`
+/// （官方 TS 类型原话），一律走 `number_of` 收口。
+fn plan_effective_times(plan: &Value) -> Vec<f64> {
+    match plan.get("entitlements").and_then(Value::as_array) {
+        Some(items) if !items.is_empty() => items
+            .iter()
+            .filter_map(|item| item.get("effective_at").and_then(number_of))
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .collect(),
+        _ => plan_bound(plan, START_KEYS)
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .into_iter()
+            .collect(),
+    }
+}
+
+/// 待生效时刻：**最早的、还没到的**那个生效时间（unix 秒）；没有就是 `None`。
+///
+/// 界面靠它写「待生效 {时间}」—— 官方同款（`resolvePendingStartPlanEffectiveTime`
+/// 取未来里最早的一个）。判定基准是 `now`（上游 `server_time`，见 `normalize`；
+/// 官方那边也用余额响应的服务端时间，不用本机时钟）。
+fn pending_until(plan: &Value, now: f64) -> Option<f64> {
+    plan_effective_times(plan)
+        .into_iter()
+        .filter(|value| *value > now)
+        .reduce(f64::min)
+}
+
+/// 这份套餐的权益**全都还没到生效时间**（官方 availability 的口径：`every(v > now)`）。
+///
+/// 与 [`pending_until`] 的差别：那个回答「有没有还没生效的权益」（界面据此标
+/// 「待生效」），这个回答「是不是一条已生效的权益都还没有」—— 后者才是额度桶
+/// 能不能算进可用读数的判据（见 `normalize` 里 `usable` 的说明）。
+fn all_pending(plan: &Value, now: f64) -> bool {
+    let times = plan_effective_times(plan);
+    !times.is_empty() && times.iter().all(|value| *value > now)
 }
 
 /// 套餐的某个时间字段，**统一折算成 unix 秒**。
@@ -625,12 +735,59 @@ fn entitlements_of(plan: &Value) -> Vec<Value> {
                         // 走 `number_of` 收口；认不出的给 0
                         "grantUnits": item.get("grant_units").and_then(number_of).map(|value| value as i64).unwrap_or(0),
                         "period": item.get("period").and_then(Value::as_str).map(str::trim).unwrap_or(""),
+                        // 权益的生效时刻（unix 秒；官方类型 `number | string | null`，
+                        // 所以走 `number_of`）。**这才是「生效时间」的权威来源**，
+                        // 套餐级的 `starts_at` 是领取时间 —— 见 [`plan_effective_times`]。
+                        // `0` 是「立即生效」哨兵（原样带出，界面按已生效处理）。
                         "effectiveAt": item.get("effective_at").and_then(number_of).map(|value| value as i64),
+                        // ── 已用 / 总量：给不给看上游 ────────────────────
+                        // 活动套餐的额度不落在 `balances` 里（见 `query_usage` 的合并
+                        // 那段），它的用量**可能**挂在这条权益上。上游给就带上，
+                        // 界面据此画一条真进度条（剩余比例）；不给一律 null ——
+                        // 界面按「不知道」处理，不拿 0 冒充。
+                        "usedUnits": item.get("used_units").and_then(number_of),
+                        "totalUnits": item.get("total_units").and_then(number_of),
+                        "remainingUnits": item.get("remaining_units").and_then(number_of),
                     }))
                 })
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// 这条读数里有没有**可用的额度桶**（billing 只在真算出桶时才 push，所以「非空」
+/// 就是「读到了」）。
+fn has_wallets(value: &Value) -> bool {
+    value
+        .get("wallets")
+        .and_then(Value::as_array)
+        .map(|list| !list.is_empty())
+        .unwrap_or(false)
+}
+
+/// billing 读数 × 监控通道的窗口读数：只把**窗口那一段**接过去（见调用点的说明）。
+///
+/// 动的是三处：`wallets`（窗口列表）、`availableView`（表头读数 —— 它描述的正是
+/// 那一列要显示什么，跟着窗口走）、`walletsFrom`（标记「额度窗口来自哪个通道」，
+/// 界面据此在悬停里说明口径）。其余键一个不动。
+fn merge_monitor_windows(billing: Value, windows: Value) -> Value {
+    let mut merged = billing;
+    let monitor_wallets = windows.get("wallets").cloned().unwrap_or(Value::Null);
+    let monitor_view = windows.get("availableView").cloned().unwrap_or(Value::Null);
+    let Some(object) = merged.as_object_mut() else {
+        return merged;
+    };
+    if !monitor_wallets.is_null() {
+        object.insert("wallets".to_string(), monitor_wallets);
+    }
+    if !monitor_view.is_null() {
+        object.insert("availableView".to_string(), monitor_view);
+    }
+    object.insert(
+        "walletsFrom".to_string(),
+        Value::String("monitor".to_string()),
+    );
+    merged
 }
 
 /// 挑一个「代表这个账号」的套餐（`subscription` 那段文案读它）。

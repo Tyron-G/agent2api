@@ -352,6 +352,7 @@
   "（免费额度池，模型名带 cline-free/ 前缀）。": " (pool de cota gratuita; nomes de modelo com o prefixo cline-free/).",
   "（其中 {n} 把恢复为不限制）": " ({n} das quais voltaram a ser ilimitadas)",
   "（必填）": " (obrigatório)",
+  "（有效期 {window}）": "(validade {window})",
   "（订阅池，模型名带 cline-pass/ 前缀，需要账号有对应订阅）。": " (pool de assinatura; nomes de modelo com o prefixo cline-pass/, e a conta precisa da assinatura correspondente).",
   "，下一次最快 {minutes} 分钟后": ", próxima tentativa em pelo menos {minutes} min",
   "，并从 {n} 把 Key 的可用提供商里移除": ", e removido dos provedores permitidos de {n} keys"

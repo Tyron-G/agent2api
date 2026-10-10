@@ -82,6 +82,8 @@ type OwnedPlan = {
   state?: string
   startsAt?: number | null
   endsAt?: number | null
+  /** 最早的、还没到的生效时间（后端按官方口径取的**权益** `effective_at`） */
+  pendingUntil?: number | null
   entitlements?: Entitlement[]
 }
 
@@ -162,6 +164,55 @@ function windowText(plan: { startsAt?: number | null; endsAt?: number | null }):
   if (end) return t('到期 {time}', { time: end })
   if (start) return t('开始 {time}', { time: start })
   return ''
+}
+
+/**
+ * 生效时间的展示串：**今天 / 明天**用相对日（官方客户端同一份数据就是显示
+ * 「待生效 今天 23:00」），更远的日子给本地日期时间。
+ */
+function effectiveText(seconds: number): string {
+  const date = new Date(seconds * 1000)
+  if (Number.isNaN(date.getTime())) return ''
+  const time = `${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`
+  // 本地日历日序号（跨时区 / 跨夏令时都按「本机的一天」算，与官方同一算法）
+  const dayIndex = (value: Date) => Math.floor(
+    Date.UTC(value.getFullYear(), value.getMonth(), value.getDate()) / 86_400_000,
+  )
+  const diff = dayIndex(date) - dayIndex(new Date())
+  if (diff === 0) return t('今天 {time}', { time })
+  if (diff === 1) return t('明天 {time}', { time })
+  return stampText(seconds)
+}
+
+/**
+ * 名下套餐的时间行：**待生效在前、到期在后**（`待生效 今天 23:00 · 到期 10月12日 09:00`）。
+ *
+ * ── 为什么不用 `startsAt`（套餐级开始时间）────────────────────
+ * 那是**领取 / 购买时间**。官方 Start Plan 卡片只展示「待生效 {生效时间}」与
+ * 「过期时间 {到期}」两样（见官方 `CodingPlanStatusMeta`），从不展示套餐级
+ * `starts_at` —— 早先我们拿它当生效时间显示，于是「领取那一刻」被读成了生效
+ * 时间（同一份套餐官方客户端写的是「待生效 今天 23:00」）。
+ * `pendingUntil` 由后端按官方口径算好（最早一条还没到点的**权益生效时间**）；
+ * 只有它和 `endsAt` 都缺时才退回 `startsAt` 兜一句。
+ */
+function planTimeText(plan: {
+  startsAt?: number | null
+  endsAt?: number | null
+  pendingUntil?: number | null
+}): string {
+  const parts: string[] = []
+  const pending = Number(plan.pendingUntil)
+  if (Number.isFinite(pending) && pending > 0) {
+    const text = effectiveText(pending)
+    if (text) parts.push(t('待生效 {time}', { time: text }))
+  }
+  const end = stampText(plan.endsAt)
+  if (end) parts.push(t('到期 {time}', { time: end }))
+  if (parts.length === 0) {
+    const start = stampText(plan.startsAt)
+    if (start) parts.push(t('开始 {time}', { time: start }))
+  }
+  return parts.join(' · ')
 }
 
 /* ─── 主体 ───────────────────────────────────── */
@@ -367,7 +418,9 @@ function PlansModal({ options, onClose }: { options: OpenOptions; onClose: () =>
                   const planId = String(plan.planId || '')
                   const state = String(plan.state || 'unknown')
                   const entitlements = entitlementLine(plan)
-                  const window_ = windowText(plan)
+                  // 时间行走 `planTimeText`（待生效 + 到期），**不用** `windowText`：
+                  // 后者的前半段是套餐级 `startsAt` = 领取时间，官方卡片不展示它
+                  const window_ = planTimeText(plan)
                   const claimedAt = planId && account?.claimPlans
                     ? Number((account.claimPlans as Record<string, unknown>)[planId]) || 0
                     : 0

@@ -185,7 +185,11 @@
       window.wbApp.toast(
         wbI18n.t('✅ 领取成功：{planId}{period}', {
           planId: result.planId || '',
-          period: window_ ? `（${window_}）` : '',
+          // 括起来的是**上游给的这段有效期**，别省掉「有效期」三个字：这个时刻来自
+          // 领取接口的 starts_at，与「什么时候开始生效」不是一回事（活动套餐常常
+          // 先领、当晚 23:00 才生效，那个时间在账号页的「套餐明细」里，按权益的
+          // effective_at 显示）。少了这三个字会被读成「现在生效了」。
+          period: window_ ? wbI18n.t('（有效期 {window}）', { window: window_ }) : '',
         }),
       );
       // 领到的额度**不在**默认那条转发通道上（编码套餐走开放平台、活动套餐走
