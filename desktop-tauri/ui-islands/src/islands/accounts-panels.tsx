@@ -49,14 +49,14 @@ import {
   providerFeatures,
   providerOf, RESET_UNKNOWN, supportsClaim, supportsUsage, supportsUsageDetail,
   tokenBlockedOf, tokenCountdownText, tokenDisableTriggeredOf, tokenReadingForRule,
-  tokenRulesOf, tokenWindowInfo,
+  tokenRulesOf, tokenWindowInfo, zcodePlanStateLabel,
 } from './accounts-domain'
 import { PRIORITY_MAX, PRIORITY_MIN, priorityOf } from './accounts-columns'
 import {
   PROXY_CUSTOM_CURRENT, PROXY_CUSTOM_EDIT, applyProxyPick,
-  commitPriority, connectionsOf, maskName, moveAccount, openSettingsDialog, poolError,
-  proxyPoolSnapshot, queryUsageOnce, setAccountEnabled, setPanelOpen, tokenUsageOf,
-  startZcodeClaim, toggleNamesHidden, usageEntryOf, usageFailureOf,
+  commitPriority, connectionsOf, maskName, moveAccount, openSettingsDialog, openZcodePlans,
+  poolError, proxyPoolSnapshot, queryUsageOnce, setAccountEnabled, setPanelOpen, tokenUsageOf,
+  toggleNamesHidden, usageEntryOf, usageFailureOf,
 } from './accounts-data'
 import { PROVIDER_ICONS } from './add-provider-pick'
 import { t } from '../i18n'
@@ -304,6 +304,11 @@ function subscriptionText(subscription: unknown): string {
   const parts: string[] = []
   if (info.planName) parts.push(t('套餐 {name}', { name: String(info.planName) }))
   if (info.status) parts.push(t('状态 {status}', { status: String(info.status) }))
+  // 三态里的非「生效中」档要说清楚：代表套餐可能是**待生效**的（刚领到还没到生效
+  // 时间的活动包，见后端 `plan_state`），只写「套餐 X 到期 …」会被读成现在就在用
+  if (info.state && String(info.state) !== 'active') {
+    parts.push(zcodePlanStateLabel(info.state))
+  }
   const expireAt = info.expireAt
   if (expireAt !== null && expireAt !== undefined && expireAt !== '') {
     const asNumber = Number(expireAt)
@@ -313,6 +318,34 @@ function subscriptionText(subscription: unknown): string {
   if (Number.isFinite(Number(info.remainQuota))) parts.push(t('余量 {value}', { value: numberText(info.remainQuota) }))
   if (Number.isFinite(Number(info.totalQuota))) parts.push(t('总量 {value}', { value: numberText(info.totalQuota) }))
   return parts.join(' ')
+}
+
+/**
+ * 读数里**待生效**的套餐（`plans` 数组里 `state === 'pending'` 的那些）。
+ * 没有这个数组的家（其余全部）与旧后端一律返回空数组 —— 判据只看字段，不看 provider。
+ *
+ * 为什么单独把这一档拎出来：活动套餐常常不是立刻生效的（官方客户端显示
+ * 「待生效 今天 23:00 · 过期时间 10月12日 09:00」），刚领到的那笔额度还没开始算。
+ * 余额列上什么都不显示，用户会以为没领上；一条徽章回答「领到了、还没到生效时间」。
+ */
+function pendingPlans(entry: UsageEntry): Array<Record<string, unknown>> {
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return []
+  const plans = (entry as Record<string, unknown>).plans
+  if (!Array.isArray(plans)) return []
+  return plans.filter(item => item && typeof item === 'object'
+    && String((item as Record<string, unknown>).state || '') === 'pending') as Array<Record<string, unknown>>
+}
+
+/** 待生效套餐的悬停说明：逐份列「名字（生效时间）」——时间可能在读数里缺失，那就只说名字 */
+function pendingPlansTitle(plans: Array<Record<string, unknown>>): string {
+  const lines = plans.map(plan => {
+    const name = String(plan.name || plan.planId || t('套餐'))
+    const starts = Number(plan.startsAt)
+    return Number.isFinite(starts) && starts > 0
+      ? t('{name}（{time} 起生效）', { name, time: formatTime(starts * 1000) })
+      : name
+  })
+  return t('已领到、还没到生效时间的套餐（生效后余额列会按它显示）：\n{lines}', { lines: lines.join('\n') })
 }
 
 /**
@@ -354,6 +387,13 @@ function usageSummary(entry: UsageEntry): { text: string; kind: string; title: s
         + `${wallet?.balanceView ? String(wallet.balanceView) : numberText(wallet?.balance)}`)
       .join(' · ')
     const subscription = subscriptionText(data.subscription)
+    // ── 「没有额度桶、但有套餐」要说明口径 ───────────────────────
+    // 这种账号（额度记在活动套餐那条通道上）在余额列里显示的是套餐的**权益额度**
+    // （发放额），不是剩余量 —— 不说明就会被读成「还剩 3 亿」。判据是结构而不是
+    // 文案（`wallets` 空 + `plans` 非空），与 `usagePool` 的兜底分支同一口径。
+    const grantNote = wallets.length === 0 && Array.isArray(data.plans) && data.plans.length > 0
+      ? [t('上游的余额读数里没有这个套餐的额度桶，剩余量读不到；余额列显示的是套餐发放的权益额度，不是剩余量')]
+      : []
     // 展示串优先：ZCode 的额度单位是 token（1 亿 = 9 位数字），而余额列只有几十
     // 像素宽 —— 后端因此给了 `availableView`（`1亿 token` 这类紧凑串）。没有这个
     // 字段的家（其余全部）走的仍是「数值 + 单位」那条老路，行为一字未变。
@@ -382,10 +422,42 @@ function usageSummary(entry: UsageEntry): { text: string; kind: string; title: s
     return {
       text: available + (missing.length ? ' ⚠' : ''),
       kind: missing.length ? 'warn' : 'ok',
-      title: [available, detail, subscription, ...absent, ...missing].filter(Boolean).join(' · '),
+      title: [available, detail, subscription, ...grantNote, ...absent, ...missing].filter(Boolean).join(' · '),
     }
   }
   return { text: t('无数据'), kind: 'muted', title: t('未返回可识别的余额数据') }
+}
+
+/**
+ * 读数里「代表这个账号」的套餐：生效中优先，其次待生效（与后端 `pick_plan` 同一
+ * 优先级 —— 一份刚领到、还没生效的套餐比一份已经不提供权益的旧套餐更该代表这个
+ * 账号）。认不出状态的条目（缺失 / 上游新取值）放在最后 —— 有总比没有强。
+ */
+function leadPlan(data: Record<string, unknown>): Record<string, unknown> | null {
+  const plans = Array.isArray(data.plans) ? data.plans as Array<Record<string, unknown>> : []
+  const stateOf = (plan: Record<string, unknown>) => String(plan?.state || '')
+  return plans.find(plan => stateOf(plan) === 'active')
+    || plans.find(plan => stateOf(plan) === 'pending')
+    || plans[0]
+    || null
+}
+
+/**
+ * 套餐里最大的一笔**发放额度**（`{units, unit}`；一笔可读的都没有时 null）。
+ *
+ * 只用来给「没有额度桶」的账号在余额列兜一个读数 —— 那是**权益额度**不是剩余量，
+ * 所以调用处把它标成「权益」并且不画进度条（见 `usagePool` 的兜底分支）。
+ */
+function biggestGrant(plan: Record<string, unknown>): { units: number; unit: string } | null {
+  const items = Array.isArray(plan.entitlements) ? plan.entitlements as Array<Record<string, unknown>> : []
+  let best: { units: number; unit: string } | null = null
+  for (const item of items) {
+    const units = Number(item?.grantUnits)
+    if (!Number.isFinite(units) || units <= 0) continue
+    const unit = String(item?.unitType || '').trim()
+    if (!best || units > best.units) best = { units, unit }
+  }
+  return best
 }
 
 /**
@@ -397,6 +469,14 @@ function usageSummary(entry: UsageEntry): { text: string; kind: string; title: s
  * 还剩多少，而「总量最大」正是它 —— 也顺带避开了每日桶在一天之内反复回满
  * 导致进度条乱跳。总量缺一个都不参与比较（没有总量就画不出进度），
  * 于是没有结构化验数据的家（其余全部）自然退回上面那套纯读数呈现。
+ *
+ * ── 没有额度桶时退回「套餐权益」（`plans` 的兜底形态）──────────
+ * 有的账号读数里**一个桶都没有**（额度记在活动套餐那条通道上），但名下挂着套餐
+ * —— 旧实现只认桶，于是「刚领到套餐」的账号在余额列里仍是一片「无额度」，
+ * 而账号页恰恰是用户确认「领到了没」的地方。这里退回代表套餐的权益额度：
+ * 那是**发放额**不是剩余量，所以读数前标明「权益」、**不画进度条**
+ * （`percent: null`，画一条满格的条会被读成「还剩这么多」）。
+ * 没有套餐也没有桶（免费账号没领过）仍然返回 null —— 那种情况「无额度」是对的。
  *
  * ── 缺失一律当「不知道」─────────────────────────────────────
  * `remainingPercent` 缺失时**不画进度条**（但名字与读数照给），
@@ -413,10 +493,22 @@ function usagePool(entry: UsageEntry): { planName: string; text: string; percent
     if (!Number.isFinite(total) || total <= 0) continue
     if (!lead || total > Number(lead.total)) lead = wallet
   }
-  if (!lead) return null
   const subscription = (data.subscription && typeof data.subscription === 'object'
     ? data.subscription
     : {}) as Record<string, unknown>
+  if (!lead) {
+    const plan = leadPlan(data)
+    const grant = plan ? biggestGrant(plan) : null
+    if (!plan || !grant) return null
+    return {
+      planName: String(plan.name || plan.planId || subscription.planName || ''),
+      text: grant.unit
+        ? t('权益 {value} {unit}', { value: compactNumber(grant.units), unit: grant.unit })
+        : t('权益 {value}', { value: compactNumber(grant.units) }),
+      // 权益额度不是剩余量：不画条（口径见上面那段）
+      percent: null,
+    }
+  }
   // 套餐名优先取这个桶自己的（`wallet.planName`），退回账号级那份 ——
   // 桶认不出归属时（上游没给 plan_id）至少还有订阅里的名字可显示
   const planName = String(lead.planName || subscription.planName || '')
@@ -703,6 +795,15 @@ export function UsageCell({ account }: { account: AccountRecord }) {
     </Badge>
   ) : null
   const tokenSub = prominentTokenLimit(account)
+  // 「待生效 N 份」徽章：注意力只在读数可用（ok / warn）时才有意义 —— 查询失败 /
+  // 未配置那几档连读数都没有，挂一条「领到了几份」反而更让人糊涂。usageDetail 那一支
+  // （CodeArts）没有套餐清单，不画。
+  const pending = summary.kind === 'ok' || summary.kind === 'warn' ? pendingPlans(entry) : []
+  const pendingBadge = pending.length ? (
+    <Badge variant='warning' shape='tag' title={pendingPlansTitle(pending)}>
+      {t('待生效 {n} 份', { n: pending.length })}
+    </Badge>
+  ) : null
   if (supportsUsageDetail(account)) {
     const usable = summary.kind === 'ok' || summary.kind === 'warn'
     const detail = usable ? usageDetailOf(entry) : null
@@ -714,6 +815,7 @@ export function UsageCell({ account }: { account: AccountRecord }) {
       <span className='usage-sum-wrap'>
         <span className={`usage-sum ${summary.kind}`} title={summary.title}>{summary.text}</span>
         {blockedBadge}
+        {pendingBadge}
         {tokenSub}
       </span>
     )
@@ -726,6 +828,7 @@ export function UsageCell({ account }: { account: AccountRecord }) {
       <span className='usage-sum-wrap'>
         <span className={`usage-sum ${summary.kind}`} title={summary.title}>{summary.text}</span>
         {blockedBadge}
+        {pendingBadge}
         {tokenSub}
       </span>
     )
@@ -738,6 +841,7 @@ export function UsageCell({ account }: { account: AccountRecord }) {
         <span className={`usage-pool-view ${summary.kind}`}>{pool.text}</span>
       </span>
       {blockedBadge}
+      {pendingBadge}
       {tokenSub}
     </span>
   )
@@ -1059,34 +1163,22 @@ export function ProxyCell({ account }: { account: AccountRecord }) {
  * （领取状态也在那里标记），账号页不再放第二颗一样的按钮。）
  */
 export function ActionsCell({ account, atFront }: { account: AccountRecord; atFront: boolean }) {
-  const [claimBusy, setClaimBusy] = React.useState(false)
   const [usageBusy, setUsageBusy] = React.useState(false)
   const canUsage = supportsUsage(account)
   const canClaim = supportsClaim(account)
 
-  async function claim(): Promise<void> {
-    // 一次领取要拖一次滑块，重复点击会开出第二个验证码流程（共用的求解器一次只允许
-    // 一个，后发起的那轮会把前一轮作废）—— 流程期间禁用这颗按钮
-    setClaimBusy(true)
-    try {
-      await startZcodeClaim(account.id)
-    } finally {
-      setClaimBusy(false)
-    }
-  }
-
   return (
     <div className='acct-actions'>
       {canClaim ? (
-        // 按钮**不因「今天领过」置灰**：同一个账号可能同时挂着几份可领套餐
-        // （活动大额包 + 每日包），而上游的「已领取过」是按套餐判的 —— 领了 A
-        // 之后 B 照样能领。今天领过没落在悬停提示里，逐份的状态（哪几份已领、
-        // 还能选哪份）由弹窗给出，见 ui/zcode-claim.js。
-        <Button variant='outline' size='xs' disabled={claimBusy}
+        // 点开**套餐明细**弹窗（zcode-plans-modal.tsx）：可领取的逐份列出（标「今日已领」、
+        // 逐份「领取」），名下的套餐也逐份列出（含**待生效**与已过期）。
+        // 按钮**不因「今天领过」置灰**：上游的「已领取过」是按套餐判的，领了 A 之后
+        // B 照样能领 —— 还能领哪几份只有弹窗里逐份比对才说得清，所以每次点都是打开它。
+        <Button variant='outline' size='xs'
           title={claimedToday(account)
             ? claimDoneTitle(account)
-            : t('探测并领取官方限时体验套餐（每天一期，需要过一次人机验证）')}
-          onClick={() => void claim()}>{t('领套餐')}</Button>
+            : t('查看可领取的套餐与名下已有的套餐（每天一期，领取需过一次人机验证）')}
+          onClick={() => openZcodePlans(account.id)}>{t('领套餐')}</Button>
       ) : null}
       {canUsage ? (
         <Button variant='outline' size='xs' disabled={usageBusy}

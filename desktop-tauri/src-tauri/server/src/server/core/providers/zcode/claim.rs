@@ -221,6 +221,23 @@ pub fn platform() -> &'static str {
     }
 }
 
+/// 操作系统的**类别名**（`windows` / `macos` / `linux`）。
+///
+/// 客户端身份头 `X-Os-Category` 与激活事件体的 `device_os_category` 共用
+/// 这一处（两处各写一份 cfg 链，迟早有一处漏改）。与 [`platform`] 的区别：
+/// 那个是「平台-架构」（`win32-x64`），这个是纯类别名 —— 上游按它分流、
+/// 不看架构。认不出的平台落 `linux`（参考实现 `normalizeOsCategory` 的
+/// 默认分支同义）。
+pub fn os_category() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "windows"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else {
+        "linux"
+    }
+}
+
 /// 一条可领取的套餐（上游 `plans[]` 的归一形态）。
 ///
 /// 字段保留上游语义：`starts_at` / `ends_at` 是 **unix 秒**（不是毫秒）——
