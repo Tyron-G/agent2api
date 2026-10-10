@@ -388,22 +388,27 @@ fn window_code(unit: Option<i64>) -> String {
     }
 }
 
-/// `type` → 量纲名。只认有证据的两档（与 `zcode-switch` 的映射相同），
-/// 认不出的**原样显示**（见模块头第 2 条）
+/// `type` → 量纲名。只认有证据的两档，认不出的**原样显示**（见模块头第 2 条）。
+///
+/// 措辞对齐官方客户端（`StatusCards.tsx` 的额度卡标题）：`TOKENS_LIMIT` 那两行官方
+/// 叫「5 小时 / 每周」，`TIME_LIMIT` 那行官方叫「工具调用」
+/// （`settings.usage.entitlementMonthlyMcpUsage`）—— 早先按参考实现写成「使用时长」，
+/// 与用户在官方界面里看到的名字对不上（同一个面板、两套名字，最容易被当成两回事）。
 fn kind_label(kind: &str) -> String {
     match kind {
         "TOKENS_LIMIT" => "提示次数".to_string(),
-        "TIME_LIMIT" => "使用时长".to_string(),
+        "TIME_LIMIT" => "工具调用".to_string(),
         "" => "额度".to_string(),
         other => other.to_string(),
     }
 }
 
-/// 量纲的计量单位（绝对量读数用；认不出的 type 与「没有绝对量」都给空串）
+/// 量纲的计量单位（绝对量读数用；认不出的 type 与「没有绝对量」都给空串）。
+/// `TIME_LIMIT` 是**工具调用次数**（官方同款语义），不是时长。
 fn kind_unit(kind: &str) -> String {
     match kind {
         "TOKENS_LIMIT" => "次".to_string(),
-        "TIME_LIMIT" => "分钟".to_string(),
+        "TIME_LIMIT" => "次".to_string(),
         _ => String::new(),
     }
 }

@@ -395,14 +395,23 @@ function PlansModal({ options, onClose }: { options: OpenOptions; onClose: () =>
             <div className='mb-1.5 flex items-center gap-2 text-[12px] font-semibold text-muted-foreground'>
               {t('我的套餐')}
               {/*
-                可用读数只在**真读到额度桶**时显示。没有桶时 `availableView` 是
+                可用读数只在**真读到额度**时显示。没有桶时 `availableView` 是
                 「无额度」，挂在下面那些套餐旁边会被读成「这份套餐没额度」——
                 而实际情况是「这个读数里没有桶」（额度可能记在活动套餐那条通道上，
                 见后端 balance.rs 的 `available` 那段）。那种情况交给下面逐份列出的
                 套餐说话。
+
+                「可用」这个前缀只在 billing 通道的读数上加：它的 `availableView`
+                是一个**量**（「1亿 token」）。监控通道（`walletsFrom`）给的是
+                **窗口表头**（「每 5 小时剩 99%」），前面再挂「可用」会读成
+                「可用 5 小时剩 99%」这种别扭句子 —— 直接摆表头即可。
               */}
               {Array.isArray(data?.wallets) && data.wallets.length > 0 && data.availableView ? (
-                <Badge variant='outline' shape='tag'>{t('可用 {value}', { value: String(data.availableView) })}</Badge>
+                <Badge variant='outline' shape='tag'>
+                  {String(data.walletsFrom || '') === 'monitor'
+                    ? String(data.availableView)
+                    : t('可用 {value}', { value: String(data.availableView) })}
+                </Badge>
               ) : null}
               <div className='ml-auto'>
                 <Button variant='outline' size='xs' disabled={inflight}
