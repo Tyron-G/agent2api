@@ -166,24 +166,7 @@
   background: var(--surface-3);
 }
 
-/* 导入导出结果 */
-.io-result {
-  display: flex;
-  align-items: flex-start;
-  gap: 9px;
-  padding: 12px 14px;
-  border: 1px solid var(--ok-bd);
-  border-radius: var(--r-md);
-  background: var(--ok-soft);
-  color: var(--text-2);
-  font-size: 12px;
-  line-height: 1.65;
-}
-
-.io-result .ico { flex: 0 0 auto; color: var(--ok); font-size: 13px; }
-.io-result b { color: var(--text); }
-
-/* 危险提示区（导出含凭证） */
+/* 危险提示区（整库备份含全部凭证） */
 .danger-zone {
   padding: 12px 14px;
   border: 1px solid var(--danger-bd);

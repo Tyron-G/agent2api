@@ -39,6 +39,7 @@ Os três pontos de entrada de conversa (`/v1/chat/completions`, `/v1/responses`,
 - [Início rápido](#início-rápido)
 - [Implantação com Docker](#implantação-com-docker)
 - [Capturas de tela](#capturas-de-tela)
+- [Backup / restauração do banco de dados](#backup--restauração-do-banco-de-dados)
 - [Estrutura do projeto](#estrutura-do-projeto)
 - [Desenvolvimento e build](#desenvolvimento-e-build)
 - [Aviso de uso](#aviso-de-uso)
@@ -144,7 +145,7 @@ Escolha o provedor e entre; o mesmo fornecedor pode manter várias versões de c
 
 ### Relatório
 
-Visão geral: requisições / taxa de sucesso / tokens / modelo mais usado, com rankings por conta e provedor, roscas de uso e mapa de calor de 365 dias:
+Visão geral: requisições / taxa de sucesso / tokens / modelo mais usado, com rankings por conta, provedor e chave do gateway, roscas de uso e mapa de calor de 365 dias:
 
 ![Visão geral do relatório: cartões de estatística, top contas / provedores, roscas de uso por modelo e por provedor](./assets/screenshots/report-overview.png)
 
@@ -157,6 +158,20 @@ Tendências: **taxa de acerto de cache** (linha) e **consumo de tokens** (área)
 As tarefas de segundo plano ficam todas nesta página (ativar / intervalo / último resultado / executar agora); a lista fica em `scheduledTasks` no `~/.agent2api/config.json` e as alterações valem na hora.
 
 ![Página de tarefas agendadas: ativação e intervalos de check-in, manutenção de credenciais, atualização do catálogo de modelos e mais](./assets/screenshots/scheduled-tasks.png)
+
+### Backup / restauração do banco de dados
+
+Em **Configurações → Dados** você pode exportar e restaurar um **backup do banco inteiro**: a exportação é um único arquivo `.db` cujo conteúdo é um instantâneo completo de todo o `agent2api.db` (contas, logs, estatísticas, chaves do gateway e configurações do painel incluídos).
+
+- **Exportar**: no desktop abre o diálogo nativo de salvamento; no painel web o download é feito pelo navegador. O banco pode chegar a centenas de MB (só a tabela `request_raw` tem limite em torno de 512MB), então os dois lados usam streaming — o arquivo inteiro nunca entra na memória.
+- **Restaurar**: escolha um arquivo no desktop, faça upload no painel web. A restauração é uma **substituição total**, não uma mesclagem — o banco atual é sobrescrito por inteiro pelo arquivo de backup, portanto:
+
+  - antes de restaurar, o banco antigo é salvo como `agent2api.db.pre-restore` (sobrescrito no mesmo nome, mantendo apenas uma cópia), para você poder trocá-lo de volta manualmente se algo der errado;
+  - depois de restaurar, o aplicativo é **reiniciado à força** para concluir a troca (a troca precisa acontecer antes de qualquer acesso ao banco). O desktop reinicia sozinho; implantações Docker voltam via `restart: unless-stopped`, enquanto um `docker run` puro (sem `--restart`) exige `docker compose up -d` manual.
+
+> ⚠️ **A antiga "importação / exportação de contas" foi removida.** Era uma transferência JSON mesclada por uid que dependia da estrutura de identidade de conta do upstream; como os tipos e campos dos provedores de proxy reverso mudam com frequência, essa lógica de normalização de identidade ficava sempre atrás do upstream, com alto custo de manutenção. O backup/restauração do banco inteiro **não entende nenhuma semântica de negócio dentro do banco**, então mudanças no upstream nunca afetam este código.
+>
+> O custo é que **a mesclagem de contas entre máquinas deixou de existir**: a restauração do banco inteiro tem semântica de substituição, então "mesclar as contas da máquina A na máquina B" não é mais possível (a mesclagem é justamente o que exige entender a identidade das contas — exatamente o que está sendo abandonado). O cc-switch tem a mesma semântica de substituição.
 
 ---
 
@@ -273,13 +288,16 @@ agent2api/
 │  │  │  │  ├─ degrade.rs       Máquina de estados de degradação por bloqueio de conteúdo (prompt neutro até as 00:00 do dia seguinte)
 │  │  │  │  ├─ credential_maintenance.rs  Renovação em lote de credenciais vencidas / perto de vencer
 │  │  │  │  ├─ usage_query.rs     Consultas de saldo / pontos (concorrência entre contas + snapshot da rodada agendada)
-│  │  │  │  ├─ scheduled_tasks.rs  Registro e laço de despacho das tarefas agendadas por intervalo (ativar / intervalo /
+│  │  │  │  └─ scheduled_tasks.rs  Registro e laço de despacho das tarefas agendadas por intervalo (ativar / intervalo /
 │  │  │  │  │                      último resultado; configuração em scheduledTasks no config.json)
-│  │  │  │  └─ account_transfer.rs + account_transfer/ / auto_checkin.rs / update/
-│  │  │  │                       Importação/exportação (com normalização de identidade) / check-in agendado / atualização do software
+│  │  │  │  └─ auto_checkin.rs / update/   Check-in agendado / atualização do software
+│  │  │  ├─ db/                Fonte única da verdade do armazenamento local: um arquivo
+│  │  │  │                     SQLite (conexão e handle / DDL e upgrades de versão /
+│  │  │  │                     migração única dos arquivos antigos / backup e restauração
+│  │  │  │                     do banco inteiro)
 │  │  │  └─ api/                 Handlers de cada rota (health/session/accounts/accounts_usage/
 │  │  │                          chat/models/keys/model_manage/stats/logs/billing/
-│  │  │                          sanitize/prompt/auto-checkin/scheduled-tasks/update/…)
+│  │  │                          sanitize/prompt/auto-checkin/scheduled-tasks/update/db/…)
 │  │  ├─ lib.rs                 Entrada do app (migração do diretório de config → configurações → bandeja → janela principal → start do backend)
 │  │  ├─ backend.rs              Ciclo de vida do servidor em processo
 │  │  ├─ legacy_install.rs       Limpeza da instalação antiga "usuário atual" (diretório / atalhos / entrada de desinstalação / inicialização automática; só release)
@@ -336,7 +354,7 @@ O que este projeto implementa é um proxy reverso local: ele reutiliza o estado 
 
 ### Credenciais e risco de dados
 
-Este projeto armazena as credenciais das contas (`accessToken` / `refreshToken` etc.) em **texto puro** no diretório de configuração local (por padrão `~/.agent2api/`), e os arquivos gerados pela exportação também contêm credenciais em texto puro. Guarde-os com cuidado: nunca faça commit em repositório público, não envie para armazenamento em nuvem nem compartilhe com terceiros. Prejuízos causados por vazamento de credenciais são de responsabilidade do usuário.
+Este projeto armazena as credenciais das contas (`accessToken` / `refreshToken` etc.) em **texto puro** no banco SQLite `agent2api.db` dentro do diretório de configuração local (por padrão `~/.agent2api/`), e o arquivo `.db` exportado pelo backup do banco inteiro é uma **cópia completa desse banco** — além das credenciais das contas, ele também contém as Keys do gateway, as definições de provedores personalizados, o hash da senha do administrador do painel e a chave do CAPTCHA de login (ALTCHA). Em outras palavras, ter esse backup equivale a ter **todas as identidades e configurações** desta instância: guarde-o com cuidado e nunca faça commit em repositório público, não envie para armazenamento em nuvem nem compartilhe com terceiros. Prejuízos causados por vazamento de credenciais são de responsabilidade do usuário.
 
 ### Sem garantias e aviso de direitos
 

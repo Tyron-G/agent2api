@@ -8,27 +8,30 @@
 //! 「聚合行的每个字段只由 `fold_into_daily` 累加而来」这条不变式的语句侧
 //! 全部落点就在这一个文件（可见性同为 `pub(super)`，调用方与拆分前相同）。
 //!
-//! ── 三个 JSON 列为什么整体读写 ──────────────────────────────
-//! `model_tokens` / `provider_stats` / `account_stats` 是 JSON 数组文本，
-//! 累计必须**先读出整行、在 Rust 里累加、再整行写回**（见 `sql.rs` 模块头的
-//! 「聚合行的读-改-写」）：总量列与三个维度列是同一批字段，增量 UPDATE 只
-//! 推进总量会让「各维之和 = 当天总量」变成两处维护。一天只有一行、数组通常
+//! ── 四个 JSON 列为什么整体读写 ──────────────────────────────
+//! `model_tokens` / `provider_stats` / `account_stats` / `key_stats` 是 JSON
+//! 数组文本，累计必须**先读出整行、在 Rust 里累加、再整行写回**（见 `sql.rs`
+//! 模块头的「聚合行的读-改-写」）：总量列与四个维度列是同一批字段，增量 UPDATE
+//! 只推进总量会让「各维之和 = 当天总量」变成两处维护。一天只有一行、数组通常
 //! 几十条，一个事务里读-改-写的代价可以接受。
 
 use std::collections::BTreeMap;
 
 use rusqlite::{params, Connection};
 
-use super::record::{AccountAccum, DailyEntry, ModelAccum, ProviderAccum};
+use super::record::{AccountAccum, DailyEntry, KeyAccum, ModelAccum, ProviderAccum};
 
 /// `request_daily` 的列顺序（所有 SELECT 都按这个顺序取，`decode_daily`
-/// 依赖它；不写 `SELECT *` 的理由同 `sql::REQUEST_COLUMNS`）
+/// 依赖它；不写 `SELECT *` 的理由同 `sql::REQUEST_COLUMNS`）。
+///
+/// ⚠️ 新列**只能加在末尾**：`decode_daily` 按序号取值，中间插一列会让
+/// 后面所有字段静默错位（同 `sql::REQUEST_COLUMNS` 的约束）。
 const DAILY_COLUMNS: &str = "date, requests, successful, tokens, cache_hit_tokens, \
-     cache_input_tokens, model_tokens, provider_stats, account_stats";
+     cache_input_tokens, model_tokens, provider_stats, account_stats, key_stats";
 
 /// JSON 数组列 → `Vec<T>`。解析失败或内容不是数组时退化成空表。
 ///
-/// 与旧实现读文件时的取向一致（坏行跳过、坏字段回落）：这三个列是**整体读写**
+/// 与旧实现读文件时的取向一致（坏行跳过、坏字段回落）：这四个列是**整体读写**
 /// 的补充维度，一个坏值不该让整天的报表读不出来 —— 退化成空表只是那一维少一段，
 /// 而总量列还在。
 fn decode_accum<T: serde::de::DeserializeOwned>(text: &str) -> Vec<T> {
@@ -46,6 +49,7 @@ fn decode_daily(row: &rusqlite::Row<'_>) -> rusqlite::Result<DailyEntry> {
     let model_tokens: String = row.get(6)?;
     let provider_stats: String = row.get(7)?;
     let account_stats: String = row.get(8)?;
+    let key_stats: String = row.get(9)?;
     Ok(DailyEntry {
         date: row.get(0)?,
         requests: row.get(1)?,
@@ -56,6 +60,7 @@ fn decode_daily(row: &rusqlite::Row<'_>) -> rusqlite::Result<DailyEntry> {
         model_tokens: decode_accum::<ModelAccum>(&model_tokens),
         provider_stats: decode_accum::<ProviderAccum>(&provider_stats),
         account_stats: decode_accum::<AccountAccum>(&account_stats),
+        key_stats: decode_accum::<KeyAccum>(&key_stats),
     })
 }
 
@@ -92,19 +97,19 @@ pub(super) fn select_daily_row(
 /// 整行写入（存在即覆盖）。
 ///
 /// `date` 是主键，所以「同一天重复记账」天然是覆盖而不是插入两行 ——
-/// 这正是选它当主键的理由（见 `schema.rs`）。三个 JSON 列由
+/// 这正是选它当主键的理由（见 `schema.rs`）。四个 JSON 列由
 /// [`encode_accum`] 编码，总量列直接取 `DailyEntry` 的字段值。
 pub(super) fn upsert_daily(conn: &Connection, day: &DailyEntry) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT INTO request_daily (date, requests, successful, tokens, cache_hit_tokens, \
-         cache_input_tokens, model_tokens, provider_stats, account_stats) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+         cache_input_tokens, model_tokens, provider_stats, account_stats, key_stats) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
          ON CONFLICT(date) DO UPDATE SET requests = excluded.requests, \
          successful = excluded.successful, tokens = excluded.tokens, \
          cache_hit_tokens = excluded.cache_hit_tokens, \
          cache_input_tokens = excluded.cache_input_tokens, \
          model_tokens = excluded.model_tokens, provider_stats = excluded.provider_stats, \
-         account_stats = excluded.account_stats",
+         account_stats = excluded.account_stats, key_stats = excluded.key_stats",
         params![
             day.date,
             day.requests,
@@ -115,6 +120,7 @@ pub(super) fn upsert_daily(conn: &Connection, day: &DailyEntry) -> rusqlite::Res
             encode_accum(&day.model_tokens),
             encode_accum(&day.provider_stats),
             encode_accum(&day.account_stats),
+            encode_accum(&day.key_stats),
         ],
     )?;
     Ok(())

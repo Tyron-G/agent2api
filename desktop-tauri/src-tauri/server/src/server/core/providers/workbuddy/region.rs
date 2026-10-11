@@ -218,12 +218,9 @@ fn env_edition_is_intl() -> bool {
 
 /// 这个 provider id 是不是 **workbuddy 系**（国内版 / 国际版都算）。
 ///
-/// 判据只在这里写一份。**什么时候该用它**：两家共用同一套账号 schema
-/// （`uid` 身份 + `edition` / `endpoint` / `prefixPath` / `platform` 与
-/// accessToken/refreshToken 凭证形态），因此凡是「按 schema 分派」的地方
-/// （账号导入导出的字段归一、身份提取、凭证形状判定）都必须把它当成一家 ——
-/// 写成 `provider == kind_id(ProviderKind::WorkBuddy)` 会让国际版掉进
-/// 「别家」那一支（导入时字段被清空、导出的账号认不出身份）。
+/// 判据只在这里写一份。两家共用同一套账号 schema（`uid` 身份 + `edition` /
+/// `endpoint` / `prefixPath` / `platform` 与 accessToken/refreshToken 凭证形态），
+/// 因此凡是「按 schema 分派」的地方都该把它当成一家。
 ///
 /// **什么时候不该用它**：任何需要区分地区的地方（目录、缓存槽、账号队列、
 /// 模型规则、报表）—— 那些地方用 `Region` 本身或 provider id，别在这里问

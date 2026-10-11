@@ -214,7 +214,16 @@ pub fn is_reserved(key: &str) -> bool {
 /// 退役后查询按账号各自到期触发，一行一账号才能逐条更新、逐条被选路读取
 /// （kv 整份读改写撑不住这个粒度）。旧快照的数据由 `core::usage_records`
 /// 启动时导入，升级后余额列不会变空白。
-pub const SCHEMA_VERSION: i64 = 9;
+/// ── 版本 10：请求按「命中的网关 Key」归因 ────────────────────
+/// 见 [`V10_SCHEMA`]。既有表加列（requests / request_daily 各一列）外加一条
+/// 复合索引。此前每条请求只记到「哪个上游账号出了力」，没有任何一列能回答
+/// 「这次调用用的是哪把网关 Key」—— 于是「谁用了多少」无从统计。这一版把
+/// `ApiKeyEntry.id` 一路带到记账点（见 `core::key_scope::KeyScope::id`）。
+///
+/// 两列都带常量 DEFAULT：历史行因此拿到 `''` / `'[]'`，与「没有命中 Key」
+/// 的运行期语义一致（免鉴权模式、环境变量 Key 都收敛到空串），不需要回填
+/// 也不会读出错值 —— 代价是老数据在「按 Key」这一维上归到未知组。
+pub const SCHEMA_VERSION: i64 = 10;
 
 /// 版本 1 的全部表与索引：改造前所有 JSON / JSONL 文件的对应形态。
 ///
@@ -620,6 +629,38 @@ const V9_SCHEMA: &str = "
 CREATE INDEX IF NOT EXISTS idx_requests_account_ts ON requests(account_id, ts);
 ";
 
+/// 版本 10：请求按「命中的网关 Key」归因。
+///
+/// ── 它服务什么 ──────────────────────────────────────────────
+/// 「这次调用用的是哪把网关 Key」。此前整条记账链路（`RecordContext` →
+/// `NewRequestEntry` → `RequestEntry` → 两条 INSERT）没有任何字段承载它，
+/// `ApiKeyEntry.id` 在 `key_scope::KeyScope::from_entry` 那里就被丢掉了 ——
+/// 因为 `KeyScope` 当时只需要两个白名单维度。于是报表只能说「哪个上游账号
+/// 出了力」，说不出「哪把 Key 用了多少」。
+///
+/// ── 为什么 request_daily 也要加一列 ─────────────────────────
+/// 报表读的是日聚合表而不是明细表（`report::range_totals` 折叠
+/// `request_daily.account_stats`），所以「按 Key」这一维必须同样落进日聚合，
+/// 否则报表页看不到它。`key_stats` 与 `account_stats` 同形（JSON 数组文本，
+/// 每项 `{id, requests, successful, tokens}`）。
+///
+/// ── 为什么是复合索引 `(key_id, ts)` ─────────────────────────
+/// 与 v9 的 `(account_id, ts)` 完全同理：按 Key 的窗口聚合要在**同一把 Key
+/// 内**做范围扫描（`WHERE key_id = ? AND ts >= ?`），复合索引让它变成一次
+/// 有序的范围读；单独补 `key_id` 只能拿到行号再回表逐行比 ts。
+///
+/// 历史行（这一版之前写下的）拿到 DEFAULT 的 `''`，在「按 Key」这一维上
+/// 归到未知组 —— 这是刻意的：空串与「没命中 Key」的运行期语义一致
+/// （免鉴权模式、环境变量 Key 都收敛到空串），读侧不必区分两者。
+const V10_SCHEMA: &str = "
+-- ── requests 补「命中的网关 Key」列（schema v10）─────────────
+ALTER TABLE requests ADD COLUMN key_id TEXT NOT NULL DEFAULT '';
+-- ── request_daily 补按 Key 的日聚合列（schema v10）───────────
+ALTER TABLE request_daily ADD COLUMN key_stats TEXT NOT NULL DEFAULT '[]';
+-- ── requests 补按 Key 聚合的索引（同 v9 的形态）──────────────
+CREATE INDEX IF NOT EXISTS idx_requests_key_ts ON requests(key_id, ts);
+";
+
 /// 把库升到 [`SCHEMA_VERSION`]（幂等：已是最新版时什么都不做）。
 ///
 /// 返回 `rusqlite::Result` 而不是本模块自造的字符串错误：调用方 `Db::open`
@@ -685,6 +726,133 @@ fn apply_version(conn: &Connection, version: i64) -> rusqlite::Result<()> {
         8 => conn.execute_batch(V8_SCHEMA),
         // v9：requests 补按账号聚合的索引（限制器的 Token 周期消耗聚合，见 V9_SCHEMA）
         9 => conn.execute_batch(V9_SCHEMA),
+        // v10：requests / request_daily 各补一列 + 按 Key 聚合的索引
+        // （请求按「命中的网关 Key」归因，见 V10_SCHEMA）
+        10 => conn.execute_batch(V10_SCHEMA),
         _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! 迁移用例。本模块此前**一条测试都没有** —— 于是每一次加版本都只靠
+    //! 「手工起一次、看能不能起来」来验，而迁移恰恰是最不该靠肉眼的那部分：
+    //! `ALTER TABLE ... ADD COLUMN` **不能**写 `IF NOT EXISTS`（SQLite 语法
+    //! 错误），幂等全靠版本号，写错了不会在编译期暴露，只会在某个特定起点的
+    //! 库上炸 —— 而「特定起点」在生产里就是「已经用了几个月的用户库」。
+
+    use rusqlite::Connection;
+
+    use super::{migrate, SCHEMA_VERSION};
+
+    /// 起一个空连接并跑到指定版本（用 `apply_version` 逐版本走，与 `migrate`
+    /// 同一条路径；`user_version` 由本函数自己写，好构造任意起点）。
+    fn at_version(version: i64) -> Connection {
+        let conn = Connection::open_in_memory().expect("内存库应当能建起来");
+        for step in 1..=version {
+            super::apply_version(&conn, step).expect("逐版本 DDL 应当能跑");
+            conn.pragma_update(None, "user_version", step).expect("写版本号");
+        }
+        conn
+    }
+
+    /// 某表是否有这一列
+    fn has_column(conn: &Connection, table: &str, column: &str) -> bool {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .expect("PRAGMA 应当能准备");
+        let mut rows = stmt.query([]).expect("PRAGMA 应当能查");
+        while let Some(row) = rows.next().expect("取一行") {
+            let name: String = row.get(1).expect("列名");
+            if name == column {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// v9 → v10 的完整迁移：两列都加上、旧行拿到默认值、索引建起来。
+    ///
+    /// 这一条是 v10 的**唯一**覆盖 —— 加列写错（列名拼错、漏了 DEFAULT、
+    /// 忘了 NOT NULL）在这里会红，而不会等到用户升级时才炸。
+    #[test]
+    fn v9_database_migrates_to_v10_with_key_columns() {
+        let conn = at_version(9);
+        // 起点自检：v9 的库确实还没有这两列（否则下面验的是别的东西）
+        assert!(!has_column(&conn, "requests", "key_id"), "v9 不该有 key_id");
+        assert!(
+            !has_column(&conn, "request_daily", "key_stats"),
+            "v9 不该有 key_stats"
+        );
+
+        // 造一条 v9 形状的旧行（只填 v1 就有的列，其余走 DEFAULT）
+        conn.execute(
+            "INSERT INTO requests (ts, model) VALUES (1000, 'deepseek-v4.1-flash')",
+            [],
+        )
+        .expect("旧行应当能插进去");
+        conn.execute(
+            "INSERT INTO request_daily (date) VALUES ('2026-10-11')",
+            [],
+        )
+        .expect("旧日聚合行应当能插进去");
+
+        migrate(&conn).expect("v9 → v10 应当能升上去");
+
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("读版本号");
+        assert_eq!(version, SCHEMA_VERSION, "版本号应当推到最新");
+
+        // 两列都到位
+        assert!(has_column(&conn, "requests", "key_id"), "v10 必须补上 key_id");
+        assert!(
+            has_column(&conn, "request_daily", "key_stats"),
+            "v10 必须补上 key_stats"
+        );
+
+        // 旧行拿到 DEFAULT：空串 / 空数组。空串正是「未归因」的运行期语义
+        // （免鉴权 / 环境变量 Key 也收敛到空串），读侧不必区分两者 —— 见
+        // `V10_SCHEMA` 的说明。这一格也是「不回填」这个决定的落点：历史明细
+        // 里没有 Key 信息，回填不出来，只能留空。
+        let old_key_id: String = conn
+            .query_row("SELECT key_id FROM requests WHERE ts = 1000", [], |row| {
+                row.get(0)
+            })
+            .expect("旧行的 key_id");
+        assert_eq!(old_key_id, "", "旧行必须拿到空串默认值");
+        let old_key_stats: String = conn
+            .query_row(
+                "SELECT key_stats FROM request_daily WHERE date = '2026-10-11'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("旧日聚合行的 key_stats");
+        assert_eq!(old_key_stats, "[]", "旧日聚合行必须拿到空数组默认值");
+
+        // 索引建起来了（按 Key 的窗口聚合要走它）
+        let index_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'index' AND name = 'idx_requests_key_ts'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("查 sqlite_master");
+        assert_eq!(index_exists, 1, "v10 必须建出 idx_requests_key_ts");
+
+        // 迁移是幂等的：再跑一次什么都不做（版本号已是最新，`migrate` 直接返回）
+        migrate(&conn).expect("重复迁移应当无害");
+    }
+
+    /// 全新库（user_version = 0）一路跑到 v10 也要有这两列 —— 新库是
+    /// 1→N 顺序跑的，**不能**把新列塞进 `V1_SCHEMA`（那会让新库与升级库的
+    /// 最终形态不一致：新库 v1 就有列，升级库要等 v10）。
+    #[test]
+    fn fresh_database_reaches_v10() {
+        let conn = Connection::open_in_memory().expect("内存库应当能建起来");
+        migrate(&conn).expect("全新库应当能升到最新");
+        assert!(has_column(&conn, "requests", "key_id"));
+        assert!(has_column(&conn, "request_daily", "key_stats"));
     }
 }

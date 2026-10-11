@@ -407,6 +407,10 @@ impl RequestStats {
     /// ── 来源标记（`is_test`，schema v7）───────────────────────────
     /// 与 id / ts 同一时刻定稿：它是**入口**（`api::model_test`）才知道的事实，
     /// 随进行中行一起写下来，于是「进行中」那一段的测试行也一眼可辨。
+    /// ── 归因 Key（`key_id`，schema v10）──────────────────────────
+    /// 同样在这一刻定稿，而且**必须**在这里写：终态是 UPDATE 补的，只改收尾侧
+    /// 会让主路径永远写不出这一列。空串 = 未归因（免鉴权 / 环境变量 Key /
+    /// 模型测试，见 `RequestEntry::key_id`）。
     pub fn record_started(
         &self,
         id: &str,
@@ -415,6 +419,7 @@ impl RequestStats {
         client_model: &str,
         client_reasoning: &str,
         is_test: bool,
+        key_id: &str,
     ) {
         if id.is_empty() {
             return;
@@ -422,7 +427,16 @@ impl RequestStats {
         let guard = self.guard();
         let _ = self.with_conn_mut(&guard, |conn| {
             let tx = conn.transaction()?;
-            sql::insert_started_request(&tx, id, ts, model, client_model, client_reasoning, is_test)?;
+            sql::insert_started_request(
+                &tx,
+                id,
+                ts,
+                model,
+                client_model,
+                client_reasoning,
+                is_test,
+                key_id,
+            )?;
             // 陈旧清理与插入同事务：僵尸行的判定时点与本次开始时点一致，
             // 中断也只影响「这次有没有清成」，不会留下半删状态
             sql::finish_stale_running(&tx, stale_cutoff(), now_ms())?;
@@ -639,7 +653,11 @@ impl RequestStats {
         // `phaseElapsedMs`（在途行「当前阶段已持续多久」，读取那一刻现算 ——
         // 理由见那个函数的说明）。汇总是**反序列化回 Value**，不是另一套结构：
         // 契约字段仍由 record.rs 的 serde 注解决定，这里只加不删
-        let rows: Vec<Value> = entries.iter().map(entry_json).collect();
+        let mut rows: Vec<Value> = entries.iter().map(entry_json).collect();
+        // `keyLabel` 是**运行期配置**的派生值（Key 名随时可改），所以只能在这一层
+        // 现算 —— 与 `providerLabel`（静态注册表，可在 `report.rs` 里算）不同。
+        // 每页最多 MAX_LIMIT(500) 行，每行一次 HashMap 查表，开销可忽略
+        self.attach_key_labels(&mut rows);
         json!({
             "entries": rows,
             "total": total,
@@ -648,18 +666,69 @@ impl RequestStats {
         })
     }
 
-    /// 筛选下拉的候选清单：明细里出现过的模型名与 provider（各按出现次数降序）。
+    /// 给明细行补 `keyLabel`：`keyId` → 当前配置里的 Key 名。
     ///
-    /// 形状 `{models: ["…"], providers: [{id, label}]}` —— provider 带 label 是
-    /// 为了让前端不必维护第二份 id → 展示名映射（与明细行的 `providerLabel`
-    /// 同一个换算函数，见 `report::provider_label`）。
+    /// ── 为什么不在 `entry_json` 里做 ────────────────────────────
+    /// 那个函数在 `report.rs`，是**纯函数**（只吃一条明细、不读运行期配置），
+    /// 报表单测靠这条性质直接喂数据。Key 名在用户配置里，只能在这一层读
+    /// （与 `filter_options` 的 `keys` 候选、`stats_api::decorate_key_labels`
+    /// 同一个换算口径 —— 三处都只认 `ApiKeyEntry.id`，名字一律现取）。
+    ///
+    /// ── 已删除的 Key / 空 id ────────────────────────────────────
+    /// 配置里查不到就**保留 id**：历史请求用过的那把 Key 仍要能辨认。
+    /// `keyId` 为空串（免鉴权 / 环境变量 Key / v10 之前的行）时给空 label ——
+    /// 明细行的空 label 由展示层用「—」占位（与空 provider 同一约定，
+    /// 见 `report::provider_label` 的说明），而不是汇总数组那种「未知 Key」
+    /// 图例名：两者用途不同。
+    fn attach_key_labels(&self, rows: &mut [Value]) {
+        // 没有任何一行带 keyId 时连配置都不必读（升级后第一次打开日志页
+        // 就是这种情况：全部旧行的 keyId 都是空串）
+        if !rows.iter().any(|row| {
+            row.get("keyId")
+                .and_then(Value::as_str)
+                .is_some_and(|id| !id.is_empty())
+        }) {
+            return;
+        }
+        let names: std::collections::HashMap<String, String> =
+            crate::server::core::api_keys::list()
+                .into_iter()
+                .map(|entry| (entry.id, entry.name))
+                .collect();
+        for row in rows.iter_mut() {
+            let Some(id) = row.get("keyId").and_then(Value::as_str).map(str::to_string) else {
+                continue;
+            };
+            let label = names
+                .get(&id)
+                .filter(|name| !name.is_empty())
+                .cloned()
+                .unwrap_or(id);
+            row["keyLabel"] = Value::String(label);
+        }
+    }
+
+    /// 筛选下拉的候选清单：明细里出现过的模型名、provider 与网关 Key
+    /// （各按出现次数降序）。
+    ///
+    /// 形状 `{models: ["…"], providers: [{id, label}], keys: [{id, label}]}` ——
+    /// provider / key 带 label 是为了让前端不必维护第二份 id → 展示名映射
+    /// （provider 与明细行的 `providerLabel` 同一个换算函数，见
+    /// `report::provider_label`）。
+    ///
+    /// ── Key 的 label 为什么在这里现算 ───────────────────────────
+    /// Key 名是**运行期配置**（`api_keys::list()` 随时可读），不是聚合行里的
+    /// 数据快照 —— 所以它和 provider 一样在这里换算，而不是像账号名那样随行
+    /// 落库（理由见 `record::KeyAccum`）。**id 已不在配置里**（Key 被删了）时
+    /// 回落到 id 本身：历史请求用过的那把 Key 仍要能筛到，否则会出现
+    /// 「列表里有这一行、下拉里却没有这个选项」这种最难解释的不一致。
     ///
     /// ── 为什么是独立端点而不是塞进列表响应 ──────────────────────
     /// 候选清单与「这一页显示什么」无关：它只在进页面时拉一次，之后翻页 / 换筛选
     /// 都不该重算（一次全表 GROUP BY 挂到每个分页请求上，是白烧）。反过来，
     /// 列表响应里塞一份清单会让每页多背几百个字符串，而消费方一个都用不上。
     ///
-    /// 降级：库不可用时给空清单（`{models: [], providers: []}`）——
+    /// 降级：库不可用时给空清单（`{models: [], providers: [], keys: []}`）——
     /// 前端据此只保留「全部」选项，筛选器退化成不可用但界面不报错；
     /// 与 `query_requests` 的空表降级同一取向（少一个功能好过整页失败）。
     pub fn filter_options(&self) -> Value {
@@ -669,12 +738,30 @@ impl RequestStats {
                 sql::select_filter_options(conn, MAX_FILTER_OPTIONS)
             })
         };
-        let (models, providers) = loaded.unwrap_or((Vec::new(), Vec::new()));
+        let (models, providers, keys) =
+            loaded.unwrap_or((Vec::new(), Vec::new(), Vec::new()));
         let providers: Vec<Value> = providers
             .into_iter()
             .map(|id| json!({ "id": id, "label": provider_label(&id) }))
             .collect();
-        json!({ "models": models, "providers": providers })
+        // id → 当前名字；删掉的 Key 查不到，回落成 id（见上面说明）
+        let names: std::collections::HashMap<String, String> =
+            crate::server::core::api_keys::list()
+                .into_iter()
+                .map(|entry| (entry.id, entry.name))
+                .collect();
+        let keys: Vec<Value> = keys
+            .into_iter()
+            .map(|id| {
+                let label = names
+                    .get(&id)
+                    .filter(|name| !name.is_empty())
+                    .cloned()
+                    .unwrap_or_else(|| id.clone());
+                json!({ "id": id, "label": label })
+            })
+            .collect();
+        json!({ "models": models, "providers": providers, "keys": keys })
     }
 
     /// 立即按当前保留期裁剪（供「改小保留天数后立即清理」用）。

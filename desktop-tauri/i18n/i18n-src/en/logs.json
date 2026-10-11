@@ -5,6 +5,7 @@
   "{matched} / {total} 条": "{matched} / {total} entries",
   "{n} 条": "{n} entries",
   "✅ 已导出 {count} 条日志到 {file}": "✅ Exported {count} log entries to {file}",
+  "✅ 已导出日志文件（{size}）": "✅ Exported the log file ({size})",
   "事件日志时间范围": "Event log time range",
   "仅 error": "error only",
   "信息": "Info",

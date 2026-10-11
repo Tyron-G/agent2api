@@ -167,8 +167,17 @@ fn main() -> ExitCode {
         ),
     );
 
-    // 停机信号：Ctrl+C（全平台）+ SIGTERM（unix，容器 stop 走这条）。
-    // 收到任一个就触发 graceful shutdown —— 在途请求跑完再退。
+    // 停机信号：Ctrl+C（全平台）+ SIGTERM（unix，容器 stop 走这条），
+    // 或**整库恢复触发的自退**（`POST /api/db/restore`）。
+    //
+    // 自退必须在这里等，不能只靠 `shutdown_tx`：那条 oneshot 汇进
+    // `server::start` 的 `stop_tx` 后只驱动 **axum 优雅停机**（释放端口、
+    // 跑完在途请求），**不会让本函数返回**。少了这条 `select!`，Docker 形态下
+    // 走网页端恢复就会停在「HTTP 已停、进程还活着」—— 容器的
+    // `restart: unless-stopped` 只重启已退出的进程，于是不会拉起、
+    // `apply_pending()` 永不执行、恢复静默失败。桌面壳不走这条路径
+    // （它用 `schedule_app_restart`），所以本改动对桌面端零影响。
+    let self_exit = state.self_exit_signal();
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -179,7 +188,12 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    runtime.block_on(wait_for_shutdown_signal());
+    runtime.block_on(async {
+        tokio::select! {
+            _ = wait_for_shutdown_signal() => {}
+            _ = self_exit.notified() => {}
+        }
+    });
     let _ = shutdown_tx.send(());
     // 给在途请求留出跑完的时间（start 内部会等 graceful shutdown 收尾）
     std::thread::sleep(std::time::Duration::from_millis(300));

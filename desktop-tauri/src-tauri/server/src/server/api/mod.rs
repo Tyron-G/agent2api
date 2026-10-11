@@ -26,6 +26,8 @@
 //!   update.rs     /api/update/*（软件更新检查 / 下载 / 进度 / 取消）
 //!   endpoints.rs  GET /api/endpoints（接口清单）
 //!   storage_api.rs GET /api/storage（统一库的位置、大小与各表条数，只读）
+//!   db_api.rs     GET /api/db/backup、POST /api/db/restore（整库 SQLite 备份 / 恢复，
+//!                 替换旧的账号导入导出；见该文件模块头）
 //!   zcode_captcha.rs GET/POST /api/zcode/captcha（活动套餐通道的人机验证令牌池：
 //!                 界面静默铸造后推入，转发层按请求取用）
 //!   upgrade_api.rs GET /api/upgrade、POST /api/upgrade/run（旧数据 → SQLite 库）
@@ -54,6 +56,8 @@ pub mod cors;
 // 自定义提供商的管理接口（新建时顺带创建首个账号；存储与账号接入见
 // `core::custom_providers` 与 `core::account_store::custom_accounts`）
 pub mod custom_providers;
+// 整库 SQLite 备份 / 恢复（导出整个库；恢复时整体替换主库并重启进程）
+pub mod db_api;
 pub mod debug_api;
 // 进行中行的断线兜底守卫（从 pipeline.rs 拆出：那边已近 1000 行，而它是
 // 「handler 被 axum 取消时补 408 终态」这一件事的完整封装，见该文件模块头）

@@ -48,11 +48,10 @@ import {
   addProviderPrompt,
   addRetryCode,
   applyUnits,
+  backupDatabase,
   cancelLanRegister,
   clearDegrade,
   dropLastRetryCode,
-  exportAccounts,
-  importAccounts,
   load,
   panelLogout,
   refreshDebug,
@@ -76,8 +75,10 @@ import {
   renderSettings,
   renderStorage,
   resolveLanConfirm,
+  resolveRestoreConfirm,
   resolveRetentionConfirm,
   restoreCategory,
+  restoreDatabase,
   saveCaptcha,
   saveClineHeaders,
   saveCors,
@@ -149,7 +150,7 @@ import { t } from '../i18n'
  * `.head-actions` / `.settings-switches` / `.settings-state` / `.retention-list` /
  * `.retention-row` / `.retention-input` / `.unit` / `.hint` / `.retention-note` /
  * `.prompt-input` / `.tag-input` / `.tag-chip` / `.tag-x` / `.storage-line` /
- * `.storage-path` / `.storage-counts` / `.storage-count` / `.danger-zone` / `.io-result`），
+ * `.storage-path` / `.storage-counts` / `.storage-count` / `.danger-zone`），
  * 它们是这一页的排版而不是「组件」（样式在 ui/css/page-settings.css）。
  * 控件换组件库：原生 input → Input、原生 checkbox → Switch、原生 select → Select 一族、
  * button → Button、`.badge` → Badge、`#retention-modal` → Dialog。
@@ -1528,45 +1529,36 @@ function DataPane({ snap }: { snap: SettingsSnapshot }) {
     <>
       <section className='panel'>
         <PanelHead
-          title={t('账号导入 / 导出')}
+          title={t('数据库备份 / 恢复')}
           tip={TIPS.io}
           actions={
             <>
               {/* 忙碌守卫与旧实现的 guard() 同形：点下去的那个按钮禁用并换文案，
                   另一个保持可点但会被守卫挡下 */}
               <Button
-                id='btn-settings-export'
+                id='btn-settings-backup'
                 variant='outline'
-                disabled={io === 'export'}
-                onClick={() => void exportAccounts()}
+                disabled={io === 'backup'}
+                onClick={() => void backupDatabase()}
               >
-                {io === 'export' ? t('导出中…') : t('导出账号')}
+                {io === 'backup' ? t('导出中…') : t('导出备份')}
               </Button>
               <Button
-                id='btn-settings-import'
+                id='btn-settings-restore'
                 variant='default'
-                disabled={io === 'import'}
-                onClick={() => void importAccounts()}
+                disabled={io === 'restore'}
+                onClick={() => void restoreDatabase()}
               >
-                {io === 'import' ? t('导入中…') : t('导入账号')}
+                {io === 'restore' ? t('恢复中…') : t('恢复备份')}
               </Button>
             </>
           }
         />
         <div className='panel-body'>
           <div className='danger-zone'>
-            <strong>{t('导出文件内含 accessToken / refreshToken / apiKey 等凭证与自定义提供商定义')}</strong>
-            {t('，可直接用于登录。请妥善保管，不要外传或上传到公共位置。')}
+            <strong>{t('备份文件是整个数据库，内含全部账号凭证、网关 Key、自定义提供商定义与面板管理员密码哈希')}</strong>
+            {t('，可直接用于登录。请妥善保管，不要外传或上传到公共位置。恢复是整体替换：当前数据库会被完全覆盖，恢复前会自动留一份替换前的副本。')}
           </div>
-          {/* 失败明细（旧实现写 innerHTML 并 display:none 收起空结果，这里条件渲染） */}
-          {snap.ioFailure ? (
-            <div className='io-result'>
-              <span className='text-destructive'>
-                {t('失败 {n} 个：{detail}', { n: snap.ioFailure.failed, detail: snap.ioFailure.detail })}
-                {snap.ioFailure.more ? t(' 等') : ''}
-              </span>
-            </div>
-          ) : null}
         </div>
       </section>
 
@@ -1731,8 +1723,45 @@ function RetentionConfirmDialog({ confirm }: { confirm: { head: string } | null 
   )
 }
 
-/* ─── 局域网访问的确认 / 注册弹窗 ─────────────── */
+/**
+ * 整库恢复的确认框。照 `RetentionConfirmDialog` 的范式：焦点落在「取消」
+ * 而不是危险键（恢复是替换语义，敲回车不该等于同意覆盖），四条关窗路径
+ * （取消 / 遮罩 / Esc / 右上角）都算取消。
+ *
+ * 正文是**固定文案**（不像保留期那样随数值变），所以直接写在这里，
+ * 不走 settings-state 的参数化弹窗。
+ */
+function RestoreConfirmDialog({ open }: { open: boolean }) {
+  const cancelRef = React.useRef<HTMLButtonElement | null>(null)
 
+  return (
+    <Dialog open={open} onOpenChange={next => { if (!next) resolveRestoreConfirm(false) }}>
+      <DialogContent className='w-[min(440px,calc(100vw-48px))]' initialFocus={cancelRef}>
+        <DialogHeader>
+          <DialogTitle>{t('恢复数据库备份')}</DialogTitle>
+        </DialogHeader>
+        <DialogBody>
+          <div className='danger-zone'>
+            {t('当前数据库里的全部账号、日志、统计与设置都会被备份文件完全覆盖。')}
+            <br />
+            <strong>{t('恢复后应用将重启。')}</strong>{t('确定继续？')}
+          </div>
+        </DialogBody>
+        <DialogFooter>
+          <div className='mr-auto' />
+          <Button ref={cancelRef} variant='outline' onClick={() => resolveRestoreConfirm(false)}>
+            {t('取消')}
+          </Button>
+          <Button variant='destructive' onClick={() => resolveRestoreConfirm(true)}>
+            {t('恢复并重启')}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+/* ─── 局域网访问的确认 / 注册弹窗 ─────────────── */
 /** 三种确认（开启 / 关闭 / 面板子开关）各自的标题、正文与确认键文案 */
 const LAN_CONFIRM_COPY: Record<
   NonNullable<LanConfirm>['mode'],
@@ -1943,6 +1972,7 @@ function SettingsPage() {
       </div>
 
       <RetentionConfirmDialog confirm={snap.retentionConfirm} />
+      <RestoreConfirmDialog open={snap.restoreConfirm} />
       <LanDialog confirm={snap.lanConfirm} register={snap.lanRegister} />
     </div>
   )

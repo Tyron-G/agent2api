@@ -41,6 +41,7 @@
 //!   mod.rs     连接与句柄（本文件）：Db::open / with / with_mut / file
 //!   schema.rs  全部建表 DDL 与版本管理（PRAGMA user_version 逐版本升级）
 //!   migrate/   旧文件 → 数据库的一次性迁移（框架 + 每个迁移项一个文件）
+//!   restore.rs 整库备份 / 恢复（VACUUM INTO 快照 + 启动期原子替换）
 //! ```
 //!
 //! ── 为什么单连接而不是连接池 ────────────────────────────────
@@ -79,6 +80,7 @@
 //! 可读的错误页面与日志。各 store 的接线点要按「数据库可能不存在」写。
 
 pub mod migrate;
+pub mod restore;
 pub mod schema;
 
 use std::path::{Path, PathBuf};
@@ -231,7 +233,10 @@ impl Db {
 ///     注意 WAL 是**写进库文件头的持久设置**，设一次以后一直有效；这里每次
 ///     打开都设一遍是为了幂等，且能从回滚日志模式库里自动切过来。
 ///     代价是多出 `-wal` / `-shm` 两个附属文件，备份时要么用 SQLite 的
-///     在线备份，要么三件一起拷（后续「导出/清理」任务需要注意）。
+///     在线备份，要么三件一起拷 —— 本项目的「导出备份」按前者做，见
+///     [`restore::snapshot_to_temp`]（checkpoint + `VACUUM INTO` 产出不含
+///     WAL 的单文件快照）；「恢复」则按「替换主库 + 清 sidecar」做，
+///     见 [`restore::apply_at`]。
 ///   - `synchronous=NORMAL`：WAL 下的推荐档位 —— 事务提交不再每次 fsync
 ///     WAL 文件，只在检查点落盘时 fsync。掉电**不会损坏库**（WAL 本身是
 ///     崩溃安全的），最多丢最近若干已提交事务；换来的是写入快一个量级。
@@ -302,6 +307,42 @@ pub(crate) mod test_temp {
             for suffix in ["", "-wal", "-shm"] {
                 let _ = std::fs::remove_file(format!("{}{}", self.path.display(), suffix));
             }
+        }
+    }
+
+    /// 测试专用：会**自己删掉整个目录**的临时目录。
+    ///
+    /// `TempDb` 只管**一个库文件**，而「整库恢复」的用例需要「一个目录 + 主库 +
+    /// pending + pre-restore + 一堆 sidecar」——清理必须覆盖目录，否则每个用例
+    /// 都会在 `$TMPDIR` 里留下一堆库文件（`TempDb` 的文档记的就是这个教训）。
+    /// 同一套约定：清理挂在 `Drop` 上，调用方要把守卫**留在作用域里**。
+    pub struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        /// 建一个带标签的空临时目录。名字带 pid,与 `TempDb` 同源(互不干扰)。
+        pub fn new(label: &str) -> TempDir {
+            let safe: String = label
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c.to_ascii_lowercase() } else { '-' })
+                .collect();
+            let path = std::env::temp_dir().join(format!("agent2api-testdir-{safe}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path)
+                .unwrap_or_else(|error| panic!("临时目录建不出来（{}）：{error}", path.display()));
+            TempDir { path }
+        }
+
+        pub fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            // 整个目录一起清:主库、pending、副本、sidecar 都在里面。
+            let _ = std::fs::remove_dir_all(&self.path);
         }
     }
 }

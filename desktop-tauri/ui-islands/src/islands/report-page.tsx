@@ -219,6 +219,8 @@ function OverviewCells({ summary, range }: { summary: StatsSummary; range: strin
  * 摆一个空卡片只会让人以为哪里坏了）；空数组表示这一维这段时间没有数据（给空态）。
  * 小标题读数是 Token 总量，与行内读数同一口径。
  */
+const TIP_KEYS = t('所选范围内每把网关 Key 各消耗了多少 Token，按 Token 用量从多到少排。这一维回答的是「用量是哪把 Key 花的」—— 提供商与账号两维只能回答「哪个上游出的力」，而 Key 才是调用方持有的凭据。Key 名取自**当前配置**（改名字这里跟着变），已被删除的 Key 显示其 id（历史请求用过，仍要能辨认）。「未知 Key」是指那批请求没有 Key 身份：免鉴权模式（一把启用的 Key 都没有）、环境变量 Key（WORKBUDDY_PROXY_API_KEY）、以及记录 Key 这个功能上线之前的旧请求 —— 后者的明细里根本没有这个信息，无法回算，会一直留在「未知 Key」里；此后新产生的请求都会记上具体的 Key。')
+
 function RankPanel({ panelId, listId, labelId, title, tip, rows, totalText, withBadge, emptyText }: {
   panelId: string; listId: string; labelId: string
   title: string; tip: string
@@ -683,6 +685,8 @@ function ReportPage() {
   const providerList: StatsGroup[] | null = summary && Array.isArray(summary.providers) ? summary.providers : null
   const accountList: StatsGroup[] | null = summary && Array.isArray(summary.accounts) ? summary.accounts : null
   const modelList: StatsGroup[] | null = summary && Array.isArray(summary.models) ? summary.models : null
+  // 网关 Key 维度：与上面几维同一约定（契约里没有就整块隐藏）
+  const keyList: StatsGroup[] | null = summary && Array.isArray(summary.keys) ? summary.keys : null
 
   /** 各板块的公共三态：错误态 / 正在加载 / 内容 */
   const errorBlock = error ? placeholder(t('读取报表失败：{error}', { error }), 'empty report-error') : null
@@ -715,7 +719,7 @@ function ReportPage() {
         </div>
       </section>
 
-      {/* ── Top 提供商 / Top 账号（并排两张卡，各自独立判断显隐）── */}
+      {/* ── Top 提供商 / Top 账号 / Top 网关 Key（并排三张卡，各自独立判断显隐）── */}
       <div className='report-rank-grid'>
         {accountList ? (
           <RankPanel panelId='report-accounts-panel' listId='report-accounts' labelId='report-accounts-label'
@@ -726,6 +730,13 @@ function ReportPage() {
           <RankPanel panelId='report-providers-panel' listId='report-providers' labelId='report-providers-label'
             title={t('Top 提供商')} tip={TIP_PROVIDERS} rows={rankRows(providerList) || []}
             totalText={rankTotalText(providerList)} withBadge={false} emptyText={t('所选范围内还没有请求记录')} />
+        ) : null}
+        {/* Top Key 与上面两张同形，排在它们后面（这一维回答的是「谁调用的」，
+            比「谁承载的」更靠上游） */}
+        {keyList ? (
+          <RankPanel panelId='report-keys-panel' listId='report-keys' labelId='report-keys-label'
+            title={t('Top 网关 Key')} tip={TIP_KEYS} rows={rankRows(keyList) || []}
+            totalText={rankTotalText(keyList)} withBadge={false} emptyText={t('所选范围内还没有 Key 用量')} />
         ) : null}
       </div>
 

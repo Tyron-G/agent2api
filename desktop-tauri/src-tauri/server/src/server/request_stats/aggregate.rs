@@ -22,9 +22,9 @@ use serde_json::{json, Value};
 use super::clock::{date_key, day_of, local_midnight_ms};
 use super::record::{DailyEntry, RequestEntry};
 use super::report::{
-    build_accounts, build_models, build_providers, build_top_model, cache_rates, cache_trend_24h,
-    daily_trend, heatmap, normalize_range, push_account_accum, push_model_accum,
-    push_provider_accum, range_bounds, range_totals, streak,
+    build_accounts, build_keys, build_models, build_providers, build_top_model, cache_rates,
+    cache_trend_24h, daily_trend, heatmap, normalize_range, push_account_accum, push_key_accum,
+    push_model_accum, push_provider_accum, range_bounds, range_totals, streak,
 };
 use super::{daily, sql};
 use super::legacy;
@@ -149,6 +149,9 @@ pub(super) fn summarize(
     // accounts 与 providers / topModel **同源同区间**（同上）：账号排行的
     // 请求数之和也等于 overview.requests
     let accounts = build_accounts(&totals.account_totals);
+    // keys 与前两维**同源同区间**（同上）：Key 排行的请求数之和也等于
+    // overview.requests。`label` 此处是 id 兜底，展示名由 API 层补（见 build_keys）
+    let keys = build_keys(&totals.key_totals);
     // models 同样与 topModel 同源（`topModel` 就是这张表的冠军）：
     // 报表的「模型用量」环形图读它，各扇区之和等于 overview.tokens
     let models = build_models(&totals.model_totals);
@@ -180,6 +183,10 @@ pub(super) fn summarize(
         // 账号是比 provider 更细的一维（一家可挂多个账号），所以这张表回答的是
         // 「具体哪个登录态在出力」——同一家的多个账号会各占一行。
         "accounts": accounts,
+        // 按网关 Key 维度的区间汇总（**新增字段，不改既有字段**，与上两维同形态）。
+        // 回答的是「用量是哪把 Key 花的」—— 门户侧「我的用量」就靠这一维，
+        // 而 provider / account 两维只能回答「哪个上游出的力」。
+        "keys": keys,
         // 按模型维度的区间汇总（**新增字段，不改既有字段**，与上两维同形态）。
         // 模型比 provider 更细：一家可以承载多个模型，所以这张表回答的是
         // 「用量花在哪个模型上」——报表的「模型用量」环形图直接读它
@@ -195,7 +202,7 @@ pub(super) fn summarize(
 ///
 /// `record` 的记账与 `rebuild_day` 的重算（还有迁移的口径回填）共用这一段：
 /// 聚合行的每个字段都**只**由明细逐条累加而来，几条路径手写几遍必然漂移
-/// （对不上账）。三个维度（模型 / provider / 账号）与总量并列累计，
+/// （对不上账）。四个维度（模型 / provider / 账号 / Key）与总量并列累计，
 /// 各维求和都等于当天总量，这是报表之间能对账的前提。
 ///
 /// **进行中行（status=0）在这里被拦下**：日报只折算终态。记账路径送进来的
@@ -230,6 +237,16 @@ pub(super) fn fold_into_daily(day: &mut DailyEntry, item: &RequestEntry) {
         &mut day.account_stats,
         &item.account_id,
         &item.account_name,
+        1,
+        i64::from(success),
+        item.total_tokens,
+    );
+    // Key 维度：空 key_id 也建组（免鉴权 / 环境变量 Key / 旧行，
+    // 见 push_key_accum 的注释）。这里**没有名字** —— Key 名是运行期配置，
+    // 由 API 层现算（见 record::KeyAccum）
+    push_key_accum(
+        &mut day.key_stats,
+        &item.key_id,
         1,
         i64::from(success),
         item.total_tokens,

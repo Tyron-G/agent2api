@@ -537,36 +537,27 @@ pub fn save_app_settings(app: AppHandle, patch: AppSettings) -> Result<AppSettin
     Ok(saved)
 }
 
-/// 导出账号：拉取导出数据，弹系统保存框落盘。
+/// 导出整库备份：拉取 SQLite 快照，弹系统保存框落盘。
 ///
-/// 账号与自定义提供商定义**都为 0** 时直接返回，不弹保存框 —— 让用户选完
-/// 路径再被告知「没东西可存」是纯打扰。只有定义没有账号（或反之）仍值得导：
-/// 导出文件现在同时承载两层（v2 起带 `customProviders` 段）。
+/// 载荷是**整个 SQLite 库**（见 `api::db_api` 模块头），不是任何业务对象：
+///   - 快照由后端用 `PRAGMA wal_checkpoint(TRUNCATE)` + `VACUUM INTO` 产出，
+///     事务一致、不含 WAL —— 所以这里拿到的是一份**可以直接打开的**单文件库；
+///   - 传输**逐块写盘**（`bytes_stream` + `AsyncWriteExt`），不整份进内存：
+///     库可达数百 MB，`response.bytes()` 会把它全读进内存。
+///
+/// 不预先查「有没有东西可导」：整库备份是**替换**语义，与旧导出的
+/// 「账号为 0 就不弹框」不是一回事 —— 一个空库（全新安装、还没配任何账号）
+/// 也是用户可能想存下来的状态。少一次往返，也少一处「查了但结果过期」。
 #[tauri::command]
-pub async fn export_accounts(app: AppHandle) -> Result<Value, String> {
-    let data = gateway::call("GET", "/api/accounts/export", None).await?;
-    let accounts = data
-        .get("accounts")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let custom_providers = data
-        .get("customProviders")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    if accounts.is_empty() && custom_providers.is_empty() {
-        return Ok(json!({ "count": 0 }));
-    }
-
+pub async fn backup_database(app: AppHandle) -> Result<Value, String> {
     let stamp = timestamp_for_filename();
-    let default_name = format!("workbuddy-accounts-{stamp}.json");
+    let default_name = format!("agent2api-backup-{stamp}.db");
     let file = app
         .dialog()
         .file()
-        .set_title("导出账号")
+        .set_title("导出数据库备份")
         .set_file_name(&default_name)
-        .add_filter("JSON", &["json"])
+        .add_filter("SQLite 数据库", &["db"])
         .add_filter("全部文件", &["*"])
         .blocking_save_file();
 
@@ -576,80 +567,140 @@ pub async fn export_accounts(app: AppHandle) -> Result<Value, String> {
     let path = target
         .into_path()
         .map_err(|error| format!("保存路径无效: {error}"))?;
-    let text = serde_json::to_string_pretty(&data)
-        .map_err(|error| format!("导出内容序列化失败: {error}"))?;
-    std::fs::write(&path, text.as_bytes()).map_err(|error| format!("写入账号文件失败: {error}"))?;
+
+    let response = gateway::get_stream("/api/db/backup").await?;
+    let bytes = write_response_stream(response, &path).await?;
     Ok(json!({
-        "count": accounts.len(),
-        "customProviders": custom_providers.len(),
+        "bytes": bytes,
         "file": path.to_string_lossy(),
     }))
 }
 
-/// 从文件导入账号（merge 语义：按身份匹配，命中更新、未命中追加）。
+/// 把流式响应逐块写进文件，返回写入字节数（常数内存）。
 ///
-/// 兼容两种形态：整体导出文件 `{ version, exportedAt, customProviders, accounts }`
-/// 与直接的账号数组 `[...]`。`customProviders` 段（v2 起的自定义提供商定义）
-/// 原样透传给后端 —— 账号的 provider 字段指向这些定义，丢了它们自定义账号
-/// 就导不回。
+/// 先写临时文件再 `rename` 覆盖目标？**不做**。理由：目标路径是用户刚在系统
+/// 保存框里选的，覆盖它是明确的用户意图（保存框本身就会问「是否替换」）；
+/// 而临时文件 + 改名会多出「临时文件没清掉」的残留路径，收益只是「写一半失败
+/// 时不留下半截文件」—— 半截文件在导出场景里无害（用户看得见大小不对，
+/// 重新导一次即可），不值得为它引入一套清理逻辑。
+async fn write_response_stream(
+    response: reqwest::Response,
+    path: &std::path::Path,
+) -> Result<u64, String> {
+    use futures::StreamExt;
+    use tokio::io::AsyncWriteExt;
+
+    let mut file = tokio::fs::File::create(path)
+        .await
+        .map_err(|error| format!("创建备份文件失败: {error}"))?;
+    let mut stream = response.bytes_stream();
+    let mut written: u64 = 0;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| format!("读取备份内容失败: {error}"))?;
+        file.write_all(&chunk)
+            .await
+            .map_err(|error| format!("写入备份文件失败: {error}"))?;
+        written += chunk.len() as u64;
+    }
+    file.flush()
+        .await
+        .map_err(|error| format!("写入备份文件失败: {error}"))?;
+    Ok(written)
+}
+
+/// 从文件恢复整库备份（**恢复后强制重启**）。
+///
+/// 与后端 `POST /api/db/restore` 走**同一条语义**，只是文件从「HTTP 上传」
+/// 换成「本地文件直接拷」：桌面端与后端在同一个进程里，没有理由绕一圈 HTTP
+/// 把几百 MB 读进内存再写回去。
+///
+/// 流程：
+///   1. 选文件（取消 → `{canceled:true}`）；
+///   2. **便宜的即时校验**：读前 16 字节必须是 `SQLite format 3\0`。
+///      壳侧没有 rusqlite（那是 server crate 的依赖），所以只查文件头 ——
+///      深度校验（`quick_check` + `user_version`）在启动期的
+///      `db::restore::apply_pending` 里做，那才是替换前的最后一道闸。
+///      这里查一道是为了**立刻**给用户反馈，不必等到重启后才发现选错了文件。
+///   3. 抢并发守卫（与网页端同一把）—— 抢不到直接报错，不动 pending；
+///   4. 拷到配置目录的 `agent2api.db.restore-pending`（**同名直接覆盖**：
+///      上次没应用成功的残留由本次覆盖，语义正确 —— 用户刚选的就是他要的那份）；
+///   5. 重启进程，由启动期的 `apply_pending` 完成换库。
+///
+/// ── 为什么不在这里删 `-wal` / `-shm` ─────────────────────────
+/// 运行期数据库连接还活着（这个进程就是网关本体），删 sidecar 有风险。
+/// 那件事放在启动期的 `apply_at` 里做（那时连接还没建）。
+///
+/// ── 守卫为什么在拷完之后就能放 ───────────────────────────────
+/// 它挡的是「两个写者交错、留下半截文件」。`fs::copy` 返回即代表 pending 已是
+/// 一份**完整**的文件，此后再来一次恢复只是把它整体覆盖成另一份完整文件 ——
+/// 「后到的赢」在这里是正确语义，没必要继续占着闸。
 #[tauri::command]
-pub async fn import_accounts(app: AppHandle) -> Result<Value, String> {
+pub async fn restore_database(app: AppHandle) -> Result<Value, String> {
     let file = app
         .dialog()
         .file()
-        .set_title("导入账号")
-        .add_filter("JSON", &["json"])
+        .set_title("选择数据库备份")
+        .add_filter("SQLite 数据库", &["db"])
         .add_filter("全部文件", &["*"])
         .blocking_pick_file();
 
     let Some(target) = file else {
         return Ok(json!({ "canceled": true }));
     };
-    let path = target
+    let source = target
         .into_path()
         .map_err(|error| format!("文件路径无效: {error}"))?;
-    let text = std::fs::read_to_string(&path)
-        .map_err(|error| format!("读取文件失败: {error}"))?;
 
-    let parsed: Value = serde_json::from_str(&text)
-        .map_err(|error| format!("文件不是有效 JSON: {error}"))?;
-    let document = unwrap_envelope_file(parsed);
-    let accounts = match &document {
-        // 整体导出文件
-        Value::Object(map) => map
-            .get("accounts")
-            .and_then(Value::as_array)
-            .cloned()
-            .ok_or("文件中缺少 accounts 字段")?,
-        // 直接就是账号数组
-        Value::Array(items) => items.clone(),
-        _ => return Err("文件内容既不是导出文件也不是账号数组".to_string()),
-    };
-
-    let mut payload = json!({ "accounts": accounts, "mode": "merge" });
-    if let Value::Object(map) = &document {
-        if let Some(definitions) = map.get("customProviders") {
-            payload["customProviders"] = definitions.clone();
+    // ── 即时校验：SQLite 文件头 ────────────────────────────────
+    // 与 `db::restore::SQLITE_MAGIC` 同一个常量值（那里是权威定义，但壳侧
+    // 拿不到 —— server crate 没导出它）。这里只做「明显不是库」的粗筛，
+    // 判据写死 16 字节是 SQLite 格式规范的一部分，不会变。
+    //
+    // **只读前 16 字节**，不 `read()` 整个文件：备份可达数百 MB，
+    // 为了看一眼文件头把整份读进内存是荒谬的。
+    //
+    // ⚠️ 这道粗筛**挡不住「另一个程序的合法库」**（例如 cc-switch 的备份）——
+    // 壳侧没有 rusqlite，查不了表结构。那种文件会一路走到「重启」，由启动期的
+    // `db::restore::apply_pending` 认出来并拒绝；**主库在那之前不会被动过**
+    // （校验在替换之前），用户看到的是「重启后旧数据还在 + 一句为什么没恢复」。
+    // 想即时拦住，走网页端（服务端有 rusqlite，当场回 400）。
+    {
+        use std::io::Read;
+        const SQLITE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
+        let mut header = [0u8; 16];
+        let mut file =
+            std::fs::File::open(&source).map_err(|error| format!("读取文件失败: {error}"))?;
+        let read = file
+            .read(&mut header)
+            .map_err(|error| format!("读取文件失败: {error}"))?;
+        if read < 16 || &header != SQLITE_MAGIC {
+            return Err("选择的文件不是有效的 SQLite 备份".to_string());
         }
     }
 
-    gateway::call("POST", "/api/accounts/import", Some(&payload)).await
-}
+    let config_dir = gateway::config_dir();
+    std::fs::create_dir_all(&config_dir).map_err(|error| format!("创建配置目录失败: {error}"))?;
+    let pending = config_dir.join("agent2api.db.restore-pending");
 
-/// 网页端旧版「导出」把管理 API 的 `{ success, data }` 响应信封整个存成了
-/// 文件：顶层没有 accounts 而 data 里有时下钻一层，让旧文件不作废。
-/// 标准导出文件（顶层就是 accounts）与纯账号数组原样通过。
-fn unwrap_envelope_file(parsed: Value) -> Value {
-    let Value::Object(map) = &parsed else {
-        return parsed;
+    // ── 并发守卫：与网页端的 `POST /api/db/restore` 抢**同一把** ──────
+    // 桌面壳本身就是网关本体，两个入口跑在同一个进程里，写的是同一个固定
+    // 路径 `agent2api.db.restore-pending`：网页端一边上传、用户在设置页一边
+    // 选文件恢复，两边交错就是「后到的截断前一个」，留下半截 pending，而两边
+    // 各自已经回了话。守卫住在 `db::restore`（PENDING_FILE 的归属地），
+    // 这里抢的是同一个进程级 `static`，所以真的互相挡得住。
+    //
+    // 在**拷文件之前**抢：抢不到就不该动 pending 分毫。
+    let Some(_restore_guard) = agent2api_server::server::db::restore::RestoreGuard::acquire()
+    else {
+        return Err("已有一项恢复正在进行，请稍候再试".to_string());
     };
-    if map.contains_key("accounts") {
-        return parsed;
-    }
-    match map.get("data") {
-        Some(data) if data.get("accounts").is_some() => data.clone(),
-        _ => parsed,
-    }
+
+    std::fs::copy(&source, &pending).map_err(|error| format!("写入备份文件失败: {error}"))?;
+
+    // 重启放在拷贝**之后**：`schedule_app_restart` 起一个延迟线程调
+    // `app.restart()`，本命令的返回值要能先回到前端（界面才能提示「正在重启」）。
+    schedule_app_restart(&app);
+    Ok(json!({ "restarting": true, "file": source.to_string_lossy() }))
 }
 
 /// 检查新版本：把本应用版本作为 query 参数交给后端比较。

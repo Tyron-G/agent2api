@@ -54,11 +54,12 @@ fn parse_object(
     started_at: i64,
     path: &str,
     body: &Bytes,
+    key_id: &str,
 ) -> Result<Value, Response> {
     let parsed = serde_json::from_slice::<Value>(body).ok();
     let Some(payload) = parsed.filter(Value::is_object) else {
         let error = GatewayError::bad_request("请求体必须是 JSON 对象");
-        record_early_failure(state, started_at, "", "", &error);
+        record_early_failure(state, started_at, "", "", &error, &key_id);
         logging::verbose("[Model]", &format!("← POST {path} 请求体不是 JSON 对象"));
         return Err(error.payload_response());
     };
@@ -117,9 +118,15 @@ pub async fn responses_endpoint(
     body: Bytes,
 ) -> Response {
     let scope = key_scope.map(|Extension(scope)| scope);
+    // 归因 Key（空串 = 未归因）。与 `chat.rs` 同法：`scope` 随后会被 move 进
+    // 转发层，而早失败、进行中行、收尾上下文都要用它 —— 记账与转发无关，
+    // 所以先取成 `String` 存下来（借来的话 `scope` 就 move 不出去了）。
+    let key_id = scope
+        .as_ref()
+        .map_or_else(String::new, |scope| scope.key_id().to_string());
     let started_at = logging::now_ms();
     let path = "/v1/responses";
-    let raw = match parse_object(&state, started_at, path, &body) {
+    let raw = match parse_object(&state, started_at, path, &body, &key_id) {
         Ok(value) => value,
         Err(response) => return response,
     };
@@ -137,7 +144,7 @@ pub async fn responses_endpoint(
         Ok(body) => body,
         Err(message) => {
             let error = GatewayError::bad_request(message);
-            record_early_failure(&state, started_at, &pipeline::model_field_text(&raw), &client_reasoning, &error);
+            record_early_failure(&state, started_at, &pipeline::model_field_text(&raw), &client_reasoning, &error, &key_id);
             return error.payload_response();
         }
     };
@@ -147,7 +154,7 @@ pub async fn responses_endpoint(
         .unwrap_or(false)
     {
         let error = GatewayError::bad_request("input 必须能转换成对话消息");
-        record_early_failure(&state, started_at, "", &client_reasoning, &error);
+        record_early_failure(&state, started_at, "", &client_reasoning, &error, &key_id);
         return error.payload_response();
     }
 
@@ -156,7 +163,7 @@ pub async fn responses_endpoint(
     let requested_model = match pipeline::resolve_model(&state, &mut chat_body, scope.as_ref()) {
         Ok(model) => model,
         Err(error) => {
-            record_early_failure(&state, started_at, &pipeline::model_field_text(&raw), &client_reasoning, &error);
+            record_early_failure(&state, started_at, &pipeline::model_field_text(&raw), &client_reasoning, &error, &key_id);
             return error.payload_response();
         }
     };
@@ -189,6 +196,8 @@ pub async fn responses_endpoint(
         &client_reasoning,
         // 真实流量：不是模型测试（见 `RecordContext::is_test`）
         false,
+        // 归因 Key（空串 = 未归因，见函数开头的取值处）
+        &key_id,
     );
     // 在途回写（与 /v1/chat/completions 同一处时点与理由，见
     // `pipeline::live_row_sink`）
@@ -229,6 +238,8 @@ pub async fn responses_endpoint(
         raw_response: None,
         // 真实流量：不是模型测试（见 `RecordContext::is_test`）
         is_test: false,
+        // 归因 Key（空串 = 未归因，见函数开头的取值处）
+        key_id: key_id.to_string(),
     };
 
     match outcome {
@@ -307,9 +318,15 @@ pub async fn messages_endpoint(
     body: Bytes,
 ) -> Response {
     let scope = key_scope.map(|Extension(scope)| scope);
+    // 归因 Key（空串 = 未归因）。与另两条入口同法：`scope` 随后会被 move 进
+    // 转发层，而早失败、进行中行、收尾上下文都要用它 —— 记账与转发无关，
+    // 所以先取成 `String` 存下来（借来的话 `scope` 就 move 不出去了）。
+    let key_id = scope
+        .as_ref()
+        .map_or_else(String::new, |scope| scope.key_id().to_string());
     let started_at = logging::now_ms();
     let path = "/v1/messages";
-    let raw = match parse_object(&state, started_at, path, &body) {
+    let raw = match parse_object(&state, started_at, path, &body, &key_id) {
         Ok(value) => value,
         Err(response) => return response,
     };
@@ -320,7 +337,7 @@ pub async fn messages_endpoint(
         Ok(body) => body,
         Err(message) => {
             let error = GatewayError::bad_request(message);
-            record_early_failure(&state, started_at, &pipeline::model_field_text(&raw), "", &error);
+            record_early_failure(&state, started_at, &pipeline::model_field_text(&raw), "", &error, &key_id);
             return anthropic_error_response(&error);
         }
     };
@@ -331,7 +348,7 @@ pub async fn messages_endpoint(
     let requested_model = match pipeline::resolve_model(&state, &mut chat_body, scope.as_ref()) {
         Ok(model) => model,
         Err(error) => {
-            record_early_failure(&state, started_at, &pipeline::model_field_text(&raw), &client_reasoning, &error);
+            record_early_failure(&state, started_at, &pipeline::model_field_text(&raw), &client_reasoning, &error, &key_id);
             return anthropic_error_response(&error);
         }
     };
@@ -363,6 +380,8 @@ pub async fn messages_endpoint(
         &client_reasoning,
         // 真实流量：不是模型测试（见 `RecordContext::is_test`）
         false,
+        // 归因 Key（空串 = 未归因，见函数开头的取值处）
+        &key_id,
     );
     // 在途回写（与 /v1/chat/completions 同一处时点与理由，见
     // `pipeline::live_row_sink`）
@@ -403,6 +422,8 @@ pub async fn messages_endpoint(
         raw_response: None,
         // 真实流量：不是模型测试（见 `RecordContext::is_test`）
         is_test: false,
+        // 归因 Key（空串 = 未归因，见函数开头的取值处）
+        key_id: key_id.to_string(),
     };
 
     match outcome {

@@ -70,7 +70,7 @@ use super::report::normalize_status_filter;
 const REQUEST_COLUMNS: &str = "id, ts, model, account_id, account_name, status, duration_ms, \
      first_response_ms, attempts, error, prompt_tokens, completion_tokens, total_tokens, \
      cache_read_tokens, provider, client_model, upstream_model, attempt_details, sensitive_hits, \
-     client_reasoning, upstream_reasoning, phase, phase_started_at, is_test";
+     client_reasoning, upstream_reasoning, phase, phase_started_at, is_test, key_id";
 
 // `request_daily`（按天聚合）那一支的列常量、编解码与读-改-写语句在
 // `daily.rs` —— 两张表的语句分文件后各自独立演化。
@@ -122,6 +122,9 @@ fn decode_request(row: &rusqlite::Row<'_>) -> rusqlite::Result<RequestEntry> {
         // SQLite 没有布尔类型，按 INTEGER 读再判非零 —— 不依赖驱动对 bool 的
         // 隐式转换（手改过的库里写成 2 也照样算「是测试」）
         is_test: row.get::<_, i64>(23)? != 0,
+        // 末列是 schema v10 加的（命中的网关 Key id）；旧行 DEFAULT '' → 未归因，
+        // 与「免鉴权 / 环境变量 Key / 模型测试」三种运行期情形收敛成同一个空串
+        key_id: row.get(24)?,
     })
 }
 
@@ -185,6 +188,16 @@ impl FilterPlan {
         // 它们不属于任何一家，用 status=error 看更直接（见 RequestQuery::provider）。
         if let Some(want) = filter.provider.as_deref().filter(|text| !text.is_empty()) {
             fragments.push("provider = ?".to_string());
+            binds.push(SqlValue::Text(want.to_string()));
+        }
+
+        // ①″ 网关 Key id 精确匹配（同一口径：空串当没筛）。
+        //
+        // 与 provider 那一段同形。空 id 的行（免鉴权 / 环境变量 Key / v10 之前
+        // 写出的行）不会被任何非空 id 命中，这是有意的：它们不属于任何一把 Key
+        // （见 RequestQuery::key_id）。
+        if let Some(want) = filter.key_id.as_deref().filter(|text| !text.is_empty()) {
+            fragments.push("key_id = ?".to_string());
             binds.push(SqlValue::Text(want.to_string()));
         }
 
@@ -295,10 +308,14 @@ pub(super) fn count_running(
 pub(super) fn select_filter_options(
     conn: &Connection,
     max: usize,
-) -> rusqlite::Result<(Vec<String>, Vec<String>)> {
+) -> rusqlite::Result<(Vec<String>, Vec<String>, Vec<String>)> {
     Ok((
         select_model_options(conn, max)?,
         select_distinct_ordered(conn, "provider", max)?,
+        // Key 候选与 provider 同形（都是 id 列的非空值，按出现次数降序）：
+        // 名字由调用方现算（`api_keys::list()`），这一层只回 id —— 与
+        // `build_keys` 同一分工（Key 名是运行期配置，不是数据快照）
+        select_distinct_ordered(conn, "key_id", max)?,
     ))
 }
 
@@ -453,6 +470,7 @@ pub(super) fn insert_started_request(
     client_model: &str,
     client_reasoning: &str,
     is_test: bool,
+    key_id: &str,
 ) -> rusqlite::Result<bool> {
     let existing: i64 = conn.query_row(
         "SELECT COUNT(*) FROM requests WHERE id = ?1 AND status = 0",
@@ -466,11 +484,14 @@ pub(super) fn insert_started_request(
     // 同一时刻、同一来源），进行中行就能显示「请求的什么(等级)」
     // is_test 同样随首发写入：来源是入口就知道的事实，等收尾再补会让「进行中」
     // 那一段的测试行看起来与真实流量一样
+    // key_id 更是在**中间件里**就定稿了（Key 匹配早于转发），所以它是这条
+    // 「只写开局就知道的事」的插入里最名正言顺的一个 —— 而且它**必须**在这里写：
+    // 主路径的终态是 UPDATE 补的，若只改收尾侧，这一列会永远是空串
     conn.execute(
         "INSERT INTO requests (id, ts, model, client_model, client_reasoning, status, \
-         phase, phase_started_at, is_test) \
-         VALUES (?1, ?2, ?3, ?4, ?5, 0, 'connecting', ?2, ?6)",
-        params![id, ts, model, client_model, client_reasoning, is_test as i64],
+         phase, phase_started_at, is_test, key_id) \
+         VALUES (?1, ?2, ?3, ?4, ?5, 0, 'connecting', ?2, ?6, ?7)",
+        params![id, ts, model, client_model, client_reasoning, is_test as i64, key_id],
     )?;
     Ok(true)
 }
@@ -601,7 +622,7 @@ pub(super) fn update_running_request(
          completion_tokens = ?12, total_tokens = ?13, cache_read_tokens = ?14, provider = ?15, \
          client_model = ?16, upstream_model = ?17, attempt_details = ?18, sensitive_hits = ?19, \
          client_reasoning = ?20, upstream_reasoning = ?21, phase = '', phase_started_at = NULL, \
-         is_test = ?22 \
+         is_test = ?22, key_id = ?23 \
          WHERE id = ?1 AND status = 0",
         params![
             entry.id,
@@ -628,6 +649,9 @@ pub(super) fn update_running_request(
             // 来源标记收尾时**再写一次**（而不是只在首发时写）：这条 UPDATE 是
             // 无进行中行时的兜底之外的主路径，写一次保证两条插入路径口径一致
             entry.is_test as i64,
+            // 归因 Key 同理再写一次。正常路径上它与首发时写入的值相同（两者同源，
+            // 都来自 `RecordContext`），但兜底路径（没有进行中行）也要有值
+            entry.key_id,
         ],
     )
 }
@@ -645,9 +669,9 @@ pub(super) fn insert_request(conn: &Connection, entry: &RequestEntry) -> rusqlit
         "INSERT INTO requests (id, ts, model, account_id, account_name, status, duration_ms, \
          first_response_ms, attempts, error, prompt_tokens, completion_tokens, total_tokens, \
          cache_read_tokens, provider, client_model, upstream_model, attempt_details, \
-         sensitive_hits, client_reasoning, upstream_reasoning, is_test) \
+         sensitive_hits, client_reasoning, upstream_reasoning, is_test, key_id) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
-         ?18, ?19, ?20, ?21, ?22)",
+         ?18, ?19, ?20, ?21, ?22, ?23)",
         params![
             entry.id,
             entry.ts,
@@ -671,6 +695,7 @@ pub(super) fn insert_request(conn: &Connection, entry: &RequestEntry) -> rusqlit
             entry.client_reasoning,
             entry.upstream_reasoning,
             entry.is_test as i64,
+            entry.key_id,
         ],
     )?;
     Ok(())

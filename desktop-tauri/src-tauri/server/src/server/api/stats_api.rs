@@ -144,9 +144,51 @@ pub async fn stats_summary(State(state): State<ServerState>, Query(params): Quer
         );
     }
     // 原样透传存储层的报表结果（`{range, startDate, endDate, overview, providers,
-    // heatmap, cacheRates, cacheTrend24h, dailyTrend}`），路由层不加工，避免两处口径。
-    // `providers` 是 W4 新增的 provider 维度汇总（见文件头的说明）
-    ok_json(state.request_stats().usage_summary(&requested))
+    // accounts, keys, heatmap, cacheRates, cacheTrend24h, dailyTrend}`），
+    // 路由层只做一处加工：给 `keys` 补上展示名（见下）。
+    // `providers` 是 W4 新增的 provider 维度汇总，`keys` 是本版新增的 Key 维度
+    let mut summary = state.request_stats().usage_summary(&requested);
+    decorate_key_labels(&mut summary);
+    ok_json(summary)
+}
+
+/// 给 `keys` 数组补展示名：`id` → 当前配置里的 Key 名。
+///
+/// ── 为什么在这一层做 ────────────────────────────────────────
+/// 存储层的 `build_keys` 是**纯函数**（只吃聚合行、不读运行期配置），
+/// 它给出的 `label` 是 id 兜底。Key 名是运行期配置（`api_keys::list()` 随时可读），
+/// 不是聚合行里的数据快照 —— 名字改了就该显示新名，而聚合行不会（也不该）
+/// 被回写。所以换算放在最靠近响应的一层。
+///
+/// ── 为什么不用 `provider_label` 那种静态换算 ─────────────────
+/// provider 的 id → label 走的是**静态注册表**，可以在 `report.rs` 里算；
+/// Key 名在用户配置里，只能在这一层读。
+///
+/// ── 已删除的 Key ────────────────────────────────────────────
+/// `api_keys::list()` 里查不到就**保留 `build_keys` 给的 id 兜底**：
+/// 历史请求用过的那把 Key 仍要能显示、能辨认，显示 id 好过显示空白。
+/// 空 id 那一组（免鉴权 / 环境变量 Key / 旧行）同理保持「未知 Key」文案 ——
+/// 它不在配置里，不该被任何真实 Key 的名字覆盖。
+fn decorate_key_labels(summary: &mut Value) {
+    let Some(rows) = summary.get_mut("keys").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let names: HashMap<String, String> = crate::server::core::api_keys::list()
+        .into_iter()
+        .map(|entry| (entry.id, entry.name))
+        .collect();
+    for row in rows {
+        let Some(id) = row.get("id").and_then(Value::as_str).map(str::to_string) else {
+            continue;
+        };
+        // 空 id 那一组不覆盖（它是「未知 Key」，不是某把 Key）
+        if id.is_empty() {
+            continue;
+        }
+        if let Some(name) = names.get(&id).filter(|name| !name.is_empty()) {
+            row["label"] = Value::String(name.clone());
+        }
+    }
 }
 
 /// GET /api/stats/requests?offset=&limit=&model=&provider=&status=&start=&end=
@@ -177,6 +219,10 @@ fn filter_from_params(params: &Params) -> RequestQuery {
         model: text_of(&params, "model"),
         // provider id 精确匹配；空串当没筛（见 RequestQuery::provider）
         provider: text_of(&params, "provider"),
+        // 网关 Key id 精确匹配；空串当没筛（见 RequestQuery::key_id）。
+        // 前端下拉给的是 key id（不是 Key 名）—— 名字可以改，id 是身份，
+        // 与账号 / provider 两处筛选的取值口径一致。
+        key_id: text_of(&params, "keyId"),
         // 只认 ok / error / running，其余值在存储层被忽略（不在这里重复实现归一）
         status: text_of(&params, "status"),
         // 闭开区间 [start, end)：翻页时上一页末尾的 ts 可直接当下页的 end
@@ -230,6 +276,7 @@ pub async fn clear_stats_requests(
     let filter = filter_from_params(&params);
     let has_filters = filter.model.is_some()
         || filter.provider.is_some()
+        || filter.key_id.is_some()
         || filter.status.is_some()
         || filter.start.is_some()
         || filter.end.is_some();

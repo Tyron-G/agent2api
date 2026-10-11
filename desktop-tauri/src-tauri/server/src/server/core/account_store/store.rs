@@ -17,11 +17,11 @@
 //! 这里只负责：句柄与锁、`AccountState` ↔ 表的两个端点、以及派生逻辑。
 //!
 //! ── 锁还在，但它保护的东西变了 ──────────────────────────────
-//! `guard()` 仍然是那把 `Mutex<()>`，`with_lock` / `load_locked` / `save_locked`
-//! 的签名也**必须**保持不变（`account_transfer` 直接用它们，见那边的模块头）。
-//! 变化在于它保护的**不是文件**了：以前它串行化「整份文件读-改-写」，
-//! 现在它串行化「数据库上的一次读改写周期」。语义等价 —— 两边都是「同一时刻
-//! 只有一个账号域的写者」，而数据库自己的事务保证单次写入的原子性。
+//! `guard()` 仍然是那把 `Mutex<()>`，账号层各处（`store_crud` / `store_admin` /
+//! 各 provider 适配器）都直接取它。变化在于它保护的**不是文件**了：以前它
+//! 串行化「整份文件读-改-写」，现在它串行化「数据库上的一次读改写周期」。
+//! 语义等价 —— 两边都是「同一时刻只有一个账号域的写者」，而数据库自己的
+//! 事务保证单次写入的原子性。
 //! 为什么还要留着这把锁而不是全靠 SQLite：账号层的**读-改-写**（读出一条 →
 //! 在 Rust 里改 → 写回）跨了多条语句，中间必须有东西挡住另一个写者；
 //! SQLite 的事务做不到这件事，因为「改」发生在 Rust 内存里、不在事务范围内。
@@ -241,11 +241,11 @@ impl AccountStore {
 
     /// 读全部账号（**语义要求整份数据**的路径用它，见 `sql::load_all`）。
     ///
-    /// 库不可用时返回**空列表**而不是报错：这个函数的签名（`pub`，且被
-    /// `load_locked` 直接透出）没有表达失败的位置，而它的消费方多是「读快照
-    /// 做展示/派生」—— 拿不到账号就是「没有可用账号」，各调用方本来就要处理
-    /// 这个分支（未登录、无可用账号）。反过来，**写入**路径一律返回
-    /// `Result`，数据库不可用时明确报 500，绝不让写操作静默成功。
+    /// 库不可用时返回**空列表**而不是报错：这个函数的签名（`pub(crate)`）没有
+    /// 表达失败的位置，而它的消费方多是「读快照做展示/派生」—— 拿不到账号就是
+    /// 「没有可用账号」，各调用方本来就要处理这个分支（未登录、无可用账号）。
+    /// 反过来，**写入**路径一律返回 `Result`，数据库不可用时明确报 500，
+    /// 绝不让写操作静默成功。
     pub(crate) fn load(&self, _guard: &MutexGuard<'_, ()>) -> AccountState {
         let Some(db) = self.inner.db.as_ref() else {
             return AccountState::default();
@@ -263,8 +263,7 @@ impl AccountStore {
 
     /// 写回全部账号（**按差异写**，见 `sql::save_state`）。
     ///
-    /// 这个入口只服务「本来就是整份集合的操作」，眼下三处调用：
-    ///   - `account_transfer::import_accounts`（导入合并，经 `save_locked`）；
+    /// 这个入口只服务「本来就是整份集合的操作」，眼下两处调用：
     ///   - `promote_to_front`（置顶要整队重新编号，见 `store_crud.rs`）；
     ///   - `migrate_startup`（启动迁移的整队与拆池改名，见 `store_admin.rs`）。
     /// **不属于它的**：单条增删改（各自只碰一行，走 `sql::put` /
@@ -287,26 +286,6 @@ impl AccountStore {
         guard: &MutexGuard<'_, ()>,
     ) -> Result<(), AccountStoreError> {
         self.with_conn_mut(guard, |conn| sql::save_state(conn, state))
-    }
-
-    /// 供导入导出子模块复用：在已持锁的前提下读全部账号
-    pub fn load_locked(&self, guard: &MutexGuard<'_, ()>) -> AccountState {
-        self.load(guard)
-    }
-
-    /// 供导入导出子模块复用：在已持锁的前提下写回全部账号
-    pub fn save_locked(
-        &self,
-        state: &AccountState,
-        guard: &MutexGuard<'_, ()>,
-    ) -> Result<(), AccountStoreError> {
-        self.save(state, guard)
-    }
-
-    /// 供导入导出子模块复用：加锁后执行一个「读-改-写」周期
-    pub fn with_lock<T>(&self, action: impl FnOnce(&MutexGuard<'_, ()>) -> T) -> T {
-        let guard = self.guard();
-        action(&guard)
     }
 
     /// 按 id 取一条记录（**只读一行**；不存在或数据库不可用时 None）。

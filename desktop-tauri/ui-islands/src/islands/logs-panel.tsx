@@ -13,6 +13,7 @@ import {
   type PageSizeChoice,
 } from './table-shell'
 import { t } from '../i18n'
+import { formatBytes } from './settings-model'
 
 /**
  * Agent2API · 系统事件日志面板（筛选 / 分页 / 导出 / 清空）—— React 岛。
@@ -84,8 +85,16 @@ type LogsBridge = {
   getLogStats(): Promise<LogStats>
   /** DELETE /api/logs：带筛选 = 只删命中；清空全部必须显式带 all=1（后端护栏） */
   clearLogs(query: string): Promise<unknown>
-  /** 壳侧导出（打开保存对话框）：{ canceled } / { count: 0 } / { count, file } */
-  exportLogs(): Promise<{ canceled?: boolean; count?: number; file?: string } | null | undefined>
+  /**
+   * 壳侧导出。**两个端的形状不同，必须都认**：
+   *   · 桌面端（`commands.rs` 的 `export_logs`）→ `{ count, file }`，能给出真实条数与落盘路径；
+   *   · 网页端（`web_shim.rs` 的 `downloadFile`）→ `{ saved, bytes }`，只有字节数 ——
+   *     浏览器下载链路**拿不到**行数，也拿不到（也不该有）一个「路径」。
+   * 只读 `count` / `file` 会让网页端把两个都印成 `undefined`（见 exportLogs 的提示分支）。
+   */
+  exportLogs(): Promise<{
+    canceled?: boolean; count?: number; file?: string; saved?: boolean; bytes?: number
+  } | null | undefined>
   /** 读自动刷新间隔配置（scheduledTasks.logsAutoRefresh） */
   getScheduledTasks(): Promise<{ tasks?: IntervalTask[] } | null | undefined>
 }
@@ -775,6 +784,12 @@ function LogsPanel() {
       if (!api) throw new Error(t('后端桥不可用'))
       const result = await api.exportLogs()
       if (!result || result.canceled) return
+      // 桌面端能数出行数；网页端只有字节数。**按拿到的那个报**，别硬套桌面端的字段 ——
+      // 原来只读 `count` / `file`，网页端（`{saved, bytes}`）会把两个都印成 `undefined`。
+      if (result.count === undefined) {
+        toast(t('✅ 已导出日志文件（{size}）', { size: formatBytes(Number(result.bytes) || 0) }))
+        return
+      }
       if (result.count === 0) {
         toast(t('暂无日志可导出'), 'err')
         return

@@ -27,8 +27,8 @@
 //! 令牌、不同身份撞 id 的概率可忽略（与 `commandcode_accounts` 同一手法）。
 //!
 //! ── 为什么 `userId` 存的是 email ───────────────────────────────
-//! 「从其他工具导入 / 导出」那条链路按**通用字段 `userId`** 认身份
-//! （`account_transfer::identity` 的兜底分支）。Google 的 userinfo 里虽然有
+//! 账号的**通用身份字段 `userId`** 是跨机器恢复时认身份用的（整库备份 / 恢复
+//! 会连这一列一起带走）。Google 的 userinfo 里虽然有
 //! 数字 `id`，但本仓只把它当展示 / 身份增强（网页登录会调一次 userinfo 取
 //! email，粘贴式则由用户填），因此把 email 当作本家的稳定身份存进 `userId`
 //! —— 与 MonkeyCode 存上游 user uuid 同一位置、同一语义。email 也缺失时该键

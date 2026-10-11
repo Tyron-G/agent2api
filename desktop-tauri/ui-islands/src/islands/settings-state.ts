@@ -25,7 +25,7 @@
  *     那样从 DOM 读回正在编辑的数字。
  *
  * ── 数据来源（与旧实现逐条对应，一条都不能少）────────────────
- *   壳命令：getAppSettings / saveAppSettings（启动与托盘）、exportAccounts / importAccounts；
+ *   壳命令：getAppSettings / saveAppSettings（启动与托盘）、backupDatabase / restoreDatabase；
  *   HTTP 桥：retention / retry / timeouts / debug / sanitize / prompt / storage / captcha。
  *   全部经 window.workbuddyDesktop，本文件不自己拼 URL。
  */
@@ -44,6 +44,7 @@ import {
   SETTINGS_CAT_KEY,
   TIMEOUT_FIELDS,
   errorMessage,
+  formatBytes,
   normalizeApp,
   normalizeNumbers,
   parseInteger,
@@ -80,8 +81,8 @@ export type BusyScope =
   | 'cors'
   | 'prompt'
   | 'captcha'
-  | 'export'
-  | 'import'
+  | 'backup'
+  | 'restore'
   | null
 
 /**
@@ -205,9 +206,6 @@ export type StorageState = {
   debug: number | null
 }
 
-/** 导入失败明细（只列前 3 条，more 表示还有更多） */
-export type IoFailure = { failed: number; detail: string; more: boolean } | null
-
 export type SettingsSnapshot = {
   /** 当前分类（左侧导航与右侧面板的显隐都由它派生） */
   category: string
@@ -229,9 +227,10 @@ export type SettingsSnapshot = {
   prompt: PromptState
   storage: StorageState
   captcha: { available: boolean; enabled: boolean }
-  ioFailure: IoFailure
   /** 保留期改小的确认框正文（非空即开着）；确认 / 取消都收口到 resolveRetentionConfirm */
   retentionConfirm: { head: string } | null
+  /** 整库恢复的确认框（非空即开着）；确认 / 取消都收口到 resolveRestoreConfirm */
+  restoreConfirm: boolean
   /** 局域网访问的确认框（非空即开着）；确认 / 取消都收口到 resolveLanConfirm */
   lanConfirm: LanConfirm
   /** 局域网开启流程的注册步（非空 = 弹窗切到注册表单） */
@@ -308,8 +307,8 @@ const INITIAL: SettingsSnapshot = {
     debug: null,
   },
   captcha: { available: true, enabled: false },
-  ioFailure: null,
   retentionConfirm: null,
+  restoreConfirm: false,
   lanConfirm: null,
   lanRegister: null,
   panelLogin: false,
@@ -644,26 +643,24 @@ async function applyLan(enabled: boolean, panel: boolean): Promise<void> {
   }
 }
 
-/* ─── 账号导入 / 导出 ──────────────────────── */
+/* ─── 整库备份 / 恢复 ──────────────────────── */
 
 /**
- * 导出。忙碌守卫与旧实现的 guard() 同形：点下去的那个按钮禁用并换文案（视图按
- * busy === 'export' 派生），另一个按钮保持可点但会被守卫挡下（旧实现也是这样）。
+ * 导出整库备份。忙碌守卫与旧实现同形：点下去的那个按钮禁用并换文案（视图按
+ * busy === 'backup' 派生），另一个按钮保持可点但会被守卫挡下。
+ *
+ * 导出**不轮询、不等结果确认**：壳命令返回时文件已经写完（`backup_database`
+ * 内部逐块写盘后 `flush` 才返回），这里只需要把字节数摊成人话。
  */
-export async function exportAccounts(): Promise<void> {
+export async function backupDatabase(): Promise<void> {
   if (busyScope) return
-  publish({ ioFailure: null })
-  beginBusy('export')
+  beginBusy('backup')
   try {
-    const result = await shared().workbuddyDesktop?.exportAccounts()
+    const result = await shared().workbuddyDesktop?.backupDatabase()
     if (result?.canceled) { toast(t('已取消导出')); return }
-    const count = Number(result?.count) || 0
-    const providers = Number(result?.customProviders) || 0
-    if (!count && !providers) { toast(t('没有可导出的账号'), 'err'); return }
-    // v2 导出文件附带自定义提供商定义：账号为 0 但有定义时同样值得导
-    const providerNote = providers ? t('、{n} 个自定义提供商', { n: providers }) : ''
+    const bytes = Number(result?.bytes) || 0
     const fileNote = result?.file ? t(' 到 {file}', { file: result.file }) : ''
-    toast(t('✅ 已导出 {count} 个账号{note}{file}', { count, note: providerNote, file: fileNote }))
+    toast(t('✅ 已导出数据库备份（{size}）{file}', { size: formatBytes(bytes), file: fileNote }))
   } catch (error) {
     toast(t('操作失败：{message}', { message: errorMessage(error) }), 'err')
   } finally {
@@ -671,56 +668,32 @@ export async function exportAccounts(): Promise<void> {
   }
 }
 
-/** 导入：合并策略在后端，这里只负责把结果摊成人话（失败明细收进快照，由视图渲染） */
-export async function importAccounts(): Promise<void> {
+/**
+ * 恢复整库备份：**先确认，再选文件**。
+ *
+ * 顺序不能反 —— 恢复是替换语义（当前库会被整个覆盖），必须在用户动手选文件
+ * 之前就把后果说清楚；选完文件再弹确认，用户已经付出了操作成本，确认框更
+ * 容易被顺手点掉。
+ *
+ * 成功后**不轮询、不等重启回来**：壳命令内部会调 `schedule_app_restart`，
+ * 进程随后退出并由新进程完成换库 —— 那时候这个页面的 JS 已经不存在了。
+ * 照 `applyLan` 的既有取向：提示一句就够，重启是必然发生的。
+ */
+export async function restoreDatabase(): Promise<void> {
   if (busyScope) return
-  publish({ ioFailure: null })
-  beginBusy('import')
+  if (!await askRestoreConfirm()) return
+  beginBusy('restore')
   try {
-    const result = await shared().workbuddyDesktop?.importAccounts()
-    if (result?.canceled) { toast(t('已取消导入')); return }
-
-    const added = Number(result?.added) || 0
-    const updated = Number(result?.updated) || 0
-    const skipped = Number(result?.skipped) || 0
-    const failed = Number(result?.failed) || 0
-    const errors = Array.isArray(result?.errors) ? result.errors : []
-    const custom = result?.customProviders ?? {}
-    const customAdded = Number(custom.added) || 0
-    const customUpdated = Number(custom.updated) || 0
-
-    const extras: string[] = []
-    if (skipped) extras.push(t('跳过 {n} 个', { n: skipped }))
-    if (failed) extras.push(t('失败 {n} 个', { n: failed }))
-    const suffix = extras.length ? t('，{items}', { items: extras.join(t('、')) }) : ''
-    const providerNote = (customAdded || customUpdated)
-      ? t('，自定义提供商新增 {added} 个、更新 {updated} 个', { added: customAdded, updated: customUpdated })
-      : ''
-    const summary = t('新增 {added} 个、更新 {updated} 个{suffix}{note}', {
-      added, updated, suffix, note: providerNote,
-    })
-
-    if (failed) {
-      toast(t('导入完成：{summary}', { summary }), 'err')
-      // 失败明细只列前 3 条，与账号页批量操作的展示密度保持一致；
-      // 定义警告（customProvider 标记）没有账号语义，展示时注明归属
-      const detail = errors.slice(0, 3)
-        .map(item => {
-          const label = item?.customProvider
-            ? t('自定义提供商 {id}', { id: item?.id || t('(无 id)') })
-            : (item?.id ?? t('未知账号'))
-          const message = item?.message ?? t('未知原因')
-          return t('{label}（{message}）', { label, message })
-        })
-        .join(t('；'))
-      publish({ ioFailure: { failed, detail, more: errors.length > 3 } })
-    } else {
-      toast(t('✅ 导入完成：{summary}', { summary }))
+    const result = await shared().workbuddyDesktop?.restoreDatabase()
+    if (result?.canceled) { toast(t('已取消恢复')); return }
+    // `restarting === false` 是后端如实告知「拿不到停机句柄」的情形：
+    // 备份已经放好了，但**没有任何东西会自动重启**，必须人工介入。
+    // 这时说「正在重启」就是撒谎，用户会一直等一个不会发生的重启。
+    if (result?.restarting === false) {
+      toast(result.note ? t('⚠️ {note}', { note: result.note }) : t('⚠️ 备份已就绪，但需要手动重启服务以完成恢复'))
+      return
     }
-
-    // 账号被改动（新增/更新）后让主界面立刻反映：账号列表、导航计数等；
-    // 自定义提供商定义有变化时同样要刷（分组名、模型清单都会变）
-    if (added || updated || customAdded || customUpdated) await shared().wbApp?.refresh?.()
+    toast(t('✅ 备份已就绪，正在重启以完成恢复…'))
   } catch (error) {
     toast(t('操作失败：{message}', { message: errorMessage(error) }), 'err')
   } finally {
@@ -755,7 +728,6 @@ export function resolveRetentionConfirm(accepted: boolean): void {
   publish({ retentionConfirm: null })
   resolve?.(accepted)
 }
-
 /** 弹确认框，返回 Promise<boolean>：确认继续为 true，取消 / 关窗 / Esc 为 false */
 function askRetentionShrink(head: string): Promise<boolean> {
   return new Promise(resolve => {
@@ -764,6 +736,34 @@ function askRetentionShrink(head: string): Promise<boolean> {
     if (retentionConfirmResolver) resolveRetentionConfirm(false)
     retentionConfirmResolver = resolve
     publish({ retentionConfirm: { head } })
+  })
+}
+
+/* ─── 整库恢复的确认框 ─────────────────────── */
+
+/** 恢复确认的 resolver；非空即表示弹窗开着（与 retention 那套同形） */
+let restoreConfirmResolver: ((accepted: boolean) => void) | null = null
+
+/** 关窗并把结果交给等待者（重复调用无副作用：resolver 取走即置空） */
+export function resolveRestoreConfirm(accepted: boolean): void {
+  const resolve = restoreConfirmResolver
+  restoreConfirmResolver = null
+  publish({ restoreConfirm: false })
+  resolve?.(accepted)
+}
+
+/**
+ * 恢复前的确认框。正文写死在视图层（`RESTORE_CONFIRM_*`），这里只管开关与
+ * Promise —— 与 retention 那个「正文随数值变」的框不同，恢复的文案是固定的。
+ *
+ * 弹之前先把旧的按「取消」收尾：`restoreDatabase` 已用 busyScope 挡住重入，
+ * 这里兜一层是防「resolve 被顶掉 → 旧 Promise 永远挂着」。
+ */
+function askRestoreConfirm(): Promise<boolean> {
+  return new Promise(resolve => {
+    if (restoreConfirmResolver) resolveRestoreConfirm(false)
+    restoreConfirmResolver = resolve
+    publish({ restoreConfirm: true })
   })
 }
 

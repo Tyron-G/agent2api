@@ -3,8 +3,6 @@
 //!   GET    /api/accounts                账号列表（含当前账号标记、优先级、启用状态、代理、
 //!                                       provider 与顶层 providers 摘要）
 //!   POST   /api/accounts                手动添加账号（accessToken/refreshToken JSON）
-//!   GET    /api/accounts/export         导出全部账号（含 token，换机器后导入继续用）
-//!   POST   /api/accounts/import         导入账号（merge：按 uid 匹配，命中更新、未命中追加）
 //!   POST   /api/accounts/current        把账号置顶（仅调整全局优先级）{ id }
 //!   POST   /api/accounts/batch          批量操作 { action, ids, proxy? }
 //!   POST   /api/accounts/refresh        刷新指定（或当前）账号的 token { id? }
@@ -34,7 +32,7 @@
 //! ── 分发方式：与 Node 版同构的「一个大入口 + 按路径判定」────────
 //! Node 版是 `tryHandle(req,res,path)`：先按完整路径匹配固定子路径，都不命中
 //! 才把剩余段当账号 id。这些判定顺序**是可观察行为**，例如：
-//!   DELETE /api/accounts/export → 走 `<id>` 分支 → 404「账号不存在」
+//!   DELETE /api/accounts/current → 走 `<id>` 分支 → 404「账号不存在」
 //!   GET    /api/accounts/xxx/yyy → 谁都不命中 → 404「Not found: GET ...」
 //! 若改用 axum 的静态路由 + `{id}`（matchit 静态优先），前者会变成 405 兜底，
 //! 与 Node 分叉。因此这里刻意保留 Node 的判定结构：一条 `/api/accounts/{*rest}`
@@ -194,11 +192,11 @@ pub async fn proxies_entry(State(state): State<ServerState>, request: axum::extr
 /// （只有 `usage` 那一支用它取 `id`，见 `accounts_usage::accounts_usage`）。判定顺序
 /// **照抄 Node 版**：
 ///
-///   ① 固定子路径（无尾段的一批）：GET/POST ``、GET export、POST import、
-///      POST current、POST batch、POST refresh、GET usage、POST checkin
+///   ① 固定子路径（无尾段的一批）：GET/POST ``、POST current、POST batch、
+///      POST refresh、GET usage、POST checkin
 ///   ② POST + 以 `/move` 结尾 → 调整顺序；以 `/rate-limits/clear` 结尾 → 清除限流标记
 ///   ③ PATCH / DELETE + 有剩余段 → 当成账号 id（**不做白名单校验**，
-///      所以 `DELETE /api/accounts/export` 是「删一个叫 export 的账号」）
+///      所以 `DELETE /api/accounts/current` 是「删一个叫 current 的账号」）
 ///   ④ 谁都不命中 → 404「Not found: <METHOD> <path>」（管理 API 信封）
 ///
 /// 第 ③ 步的顺序很关键：Node 的 PATCH 分支只判 `startsWith('/api/accounts/')`，
@@ -226,8 +224,6 @@ pub async fn dispatch(
 
     // ② 固定子路径（Node 版把它们放在 `<id>` 通配之前的原因）
     match (method.as_str(), rest) {
-        ("GET", "export") => return export_accounts(&state),
-        ("POST", "import") => return import_accounts(&state, body).await,
         ("POST", "current") => return set_current(&state, body).await,
         ("POST", "batch") => return batch_accounts(&state, body).await,
         ("POST", "refresh") => return refresh_account(&state, body).await,
@@ -778,50 +774,6 @@ pub async fn add_account(state: &ServerState, body: &Bytes) -> Response {
         })),
         Err(error) => store_error(error),
     }
-}
-
-// ─── GET /api/accounts/export ───────────────────────────────
-
-pub fn export_accounts(state: &ServerState) -> Response {
-    let data = crate::server::core::account_transfer::export_accounts(state.store());
-    let count = data
-        .get("accounts")
-        .and_then(Value::as_array)
-        .map(|items| items.len())
-        .unwrap_or(0);
-    logging::log("[Accounts]", &format!("📤 账号已导出: {count} 个"));
-    ok_json(data)
-}
-
-// ─── POST /api/accounts/import ──────────────────────────────
-
-pub async fn import_accounts(state: &ServerState, body: &Bytes) -> Response {
-    let payload = match parse_json_body(&body, "请求内容不是有效 JSON") {
-        Ok(value) => value,
-        Err(response) => return response,
-    };
-    // 兼容管理 API 的 `{ success, data }` 信封壳：网页端此前的「导出」把整个
-    // 信封存成了文件，顶层没有 accounts。这类文件导回时在这里下钻一层 ——
-    // 已发出的旧文件不作废；标准导出文件（顶层就是 accounts）不受影响。
-    let payload = match envelope_data(&payload) {
-        Some(data) => data,
-        None => payload,
-    };
-    match crate::server::core::account_transfer::import_accounts(state.store(), &payload) {
-        Ok(result) => ok_json(result),
-        Err(error) => store_error(error),
-    }
-}
-
-/// 若 `payload` 是「信封壳」（对象、顶层无 accounts、`data` 字段是含 accounts
-/// 的对象）则返回内层 data 的克隆，否则 None。
-fn envelope_data(payload: &Value) -> Option<Value> {
-    let object = payload.as_object()?;
-    if object.contains_key("accounts") {
-        return None;
-    }
-    let data = object.get("data")?;
-    data.get("accounts").is_some().then(|| data.clone())
 }
 
 // ─── POST /api/accounts/current ─────────────────────────────

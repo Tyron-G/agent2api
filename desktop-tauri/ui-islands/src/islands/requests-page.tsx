@@ -68,6 +68,8 @@ import { t } from '../i18n'
 type RequestEntry = {
   id?: string; ts?: number; status?: number; error?: string | null
   provider?: string; providerLabel?: string; accountId?: string; accountName?: string
+  /** 命中的网关 Key（`keyId` 是身份，`keyLabel` 是后端按当前配置现算的名字；空串 = 未归因） */
+  keyId?: string; keyLabel?: string
   model?: string; clientModel?: string; upstreamModel?: string
   clientReasoning?: string; upstreamReasoning?: string
   durationMs?: number; firstResponseMs?: number | null
@@ -85,7 +87,12 @@ type RequestQueryResult = {
 }
 
 type ProviderOption = { value: string; label: string }
-type FilterOptionsResult = { providers?: { id?: string; label?: string }[]; models?: string[] }
+/** 候选清单：`keys` 与 `providers` 同形（都是 `{id, label}`，见后端 filter_options） */
+type FilterOptionsResult = {
+  providers?: { id?: string; label?: string }[]
+  models?: string[]
+  keys?: { id?: string; label?: string }[]
+}
 type IntervalTask = { id?: string; enabled?: boolean; interval?: number; unit?: string }
 
 /** 本页用到的壳侧接口（见 bridge.rs 的「请求日志」那一段） */
@@ -258,6 +265,7 @@ function phaseElapsedLineHtml(entry: unknown): string {
 const COLUMNS: Column[] = [
   { key: 'time', label: t('时间'), sel: '.req-time', track: '92px' },
   { key: 'target', label: t('提供商 / 账号'), sel: '.req-target', track: 'minmax(0, 1.1fr)' },
+  { key: 'key', label: t('网关 Key'), sel: '.req-key', track: 'minmax(0, 0.8fr)' },
   { key: 'retry', label: t('重试'), sel: '.req-retry', track: '52px' },
   { key: 'status', label: t('状态'), sel: '.req-status', track: '96px' },
   { key: 'model', label: t('模型'), sel: '.req-model', track: 'minmax(0, 1.3fr)' },
@@ -314,9 +322,10 @@ const STATUS_OPTIONS: readonly { value: string; label: string }[] = [
 const ALL_STATUS_LABEL = t('全部状态')
 const ALL_PROVIDER_LABEL = t('全部提供商')
 const ALL_MODEL_LABEL = t('全部模型')
+const ALL_KEY_LABEL = t('全部 Key')
 
-type Filters = { status: string; provider: string; model: string }
-const DEFAULT_FILTERS: Filters = { status: '', provider: '', model: '' }
+type Filters = { status: string; provider: string; model: string; key: string }
+const DEFAULT_FILTERS: Filters = { status: '', provider: '', model: '', key: '' }
 
 /** 时间档位对应的毫秒下界（闭区间起点） */
 function midnight(date: Date): number {
@@ -385,7 +394,7 @@ let colTried = false
 type PanelHandle = {
   load(options?: LoadOptions): Promise<void>
   setAuto(next: { ms: number; enabled: boolean }): void
-  setFilterOptions(providers: ProviderOption[], models: string[]): void
+  setFilterOptions(providers: ProviderOption[], models: string[], keys: ProviderOption[]): void
   /** 列设置变更后按新列集合重画列表（用 flushSync 同步调用，见 onChange） */
   repaint(): void
 }
@@ -428,13 +437,14 @@ function readSavedFilters(): Filters {
   return { ...savedFilters }
 }
 
-/** 三个筛选整体落盘（变更时调用，口径与旧实现一致） */
+/** 四个筛选整体落盘（变更时调用，口径与旧实现一致） */
 function persistFilters(filters: Filters): void {
   savedFilters = { ...filters }
   shared().wbFilterMemory?.save(FILTERS_KEY, {
     status: filters.status || '',
     provider: filters.provider || '',
     model: filters.model || '',
+    key: filters.key || '',
   })
 }
 
@@ -457,6 +467,9 @@ function filterParams(): URLSearchParams {
   const status = current.runningOnly ? 'running' : current.filters.status
   if (status) params.set('status', status)
   if (current.filters.provider) params.set('provider', current.filters.provider)
+  // 网关 Key 走 `keyId`（后端参数名，见 stats_api::filter_from_params）：
+  // 值是 Key 的 **id** 而不是名字 —— 名字可改，id 是身份
+  if (current.filters.key) params.set('keyId', current.filters.key)
   if (current.filters.model) params.set('model', current.filters.model)
   return params
 }
@@ -567,14 +580,14 @@ function uniqueRowKeys(rows: RequestEntry[]): string[] {
   })
 }
 
-/* ─── 筛选清单（提供商 / 模型两个下拉的候选）────── */
+/* ─── 筛选清单（提供商 / 模型 / 网关 Key 三个下拉的候选）────── */
 
 /**
- * 刷新两个下拉的候选清单（内部节流 30 秒）。
+ * 刷新三个下拉的候选清单（内部节流 30 秒）。
  *
- * 清单来自 `GET /api/stats/requests/filters` —— 明细里**实际出现过**的模型名与 provider id，
- * 与时间档位无关（跟着结果集收窄会让选中项在下次刷新后凭空消失）。失败静默：读不到时两个下拉
- * 只留「全部」项（筛选器退化成不可用，列表照常显示）。
+ * 清单来自 `GET /api/stats/requests/filters` —— 明细里**实际出现过**的模型名、provider id
+ * 与网关 Key id，与时间档位无关（跟着结果集收窄会让选中项在下次刷新后凭空消失）。失败静默：
+ * 读不到时三个下拉只留「全部」项（筛选器退化成不可用，列表照常显示）。
  */
 async function refreshFilterOptions(): Promise<void> {
   if (Date.now() - filterOptionsAt < FILTER_OPTIONS_TTL_MS) return
@@ -588,7 +601,12 @@ async function refreshFilterOptions(): Promise<void> {
     const models: string[] = (Array.isArray(filters?.models) ? filters.models : [])
       .map(name => String(name || ''))
       .filter(Boolean)
-    handle?.setFilterOptions(providers, models)
+    // Key 候选与 provider 同形（`{id, label}`）；label 是后端按当前配置现算的名字，
+    // 已被删除的 Key 回落到 id（见后端 filter_options 的说明）
+    const keys: ProviderOption[] = (Array.isArray(filters?.keys) ? filters.keys : [])
+      .map(item => ({ value: String(item?.id || ''), label: String(item?.label || item?.id || '') }))
+      .filter(item => item.value)
+    handle?.setFilterOptions(providers, models, keys)
   } catch (error) {
     console.warn('读取请求日志筛选清单失败，筛选项退化为「全部」:', errorMessage(error))
   }
@@ -752,6 +770,26 @@ function requestCell(entry: RequestEntry, column: VisibleColumn): React.ReactNod
           ) : (
             <span className='req-acct is-empty'
               title={t('请求在任何账号接手之前就失败了')}>—</span>
+          )}
+        </span>
+      )
+    }
+
+    case 'key': {
+      // `keyLabel` 由后端按**当前配置**现算（Key 名可改），`keyId` 是身份。
+      // 两者都空 = 未归因（免鉴权 / 环境变量 Key / v10 之前的行），给破折号 ——
+      // 与 target 列的空账号同一约定，而不是留白
+      const id = String(entry.keyId ?? '').trim()
+      const label = String(entry.keyLabel ?? '').trim() || id
+      return (
+        <span key={key} className={className}>
+          {label ? (
+            <span className='req-key' title={id && id !== label ? t('{name}（{id}）', { name: label, id }) : label}>
+              {label}
+            </span>
+          ) : (
+            <span className='req-key is-empty'
+              title={t('这条明细没有记录网关 Key（免鉴权、环境变量 Key 或升级前的旧数据）')}>—</span>
           )}
         </span>
       )
@@ -961,6 +999,7 @@ function RequestsPage() {
   const [auto, setAuto] = React.useState(() => ({ ms: autoRefreshMs, enabled: autoEnabled }))
   const [providerOptions, setProviderOptions] = React.useState<ProviderOption[]>([])
   const [modelOptions, setModelOptions] = React.useState<string[]>([])
+  const [keyOptions, setKeyOptions] = React.useState<ProviderOption[]>([])
   /** 列设置注册完成 / 配置变更后的重画计数（visibleColumns 读的是模块级句柄） */
   const [, setColumnsVersion] = React.useState(0)
 
@@ -1071,7 +1110,9 @@ function RequestsPage() {
     handle = {
       load: loadPanel,
       setAuto: next => setAuto(next),
-      setFilterOptions: (providers, models) => { setProviderOptions(providers); setModelOptions(models) },
+      setFilterOptions: (providers, models, keys) => {
+        setProviderOptions(providers); setModelOptions(models); setKeyOptions(keys)
+      },
       repaint: () => setColumnsVersion(version => version + 1),
     }
     // 悬停面板的事件委托挂在列表容器上（容器不随重绘更换），加载期挂一次即可
@@ -1237,6 +1278,12 @@ function RequestsPage() {
   else if (filters.status === 'ok') summaryParts.push(t('只看成功'))
   else if (filters.status === 'error') summaryParts.push(t('只看失败'))
   if (filters.provider) summaryParts.push(providerLabelOf(filters.provider))
+  // Key 这一维要摊出**名字**而不是 id：下拉里显示的是 `label`（Key 名可改），
+  // 页脚却印一个 `k19a3f2c4b0` 就与用户刚选的那一项对不上 —— 与上面 provider
+  // 走 `providerLabelOf` 同一口径。找不到（Key 已被删）时退回 id，别让条件消失。
+  if (filters.key) {
+    summaryParts.push(keyOptions.find(item => item.value === filters.key)?.label || filters.key)
+  }
   if (filters.model) summaryParts.push(filters.model)
 
   /** 选中值不在候选清单里（筛着某个模型时把日志清空了 / 排在第 201 位）就把它自己补进去 ——
@@ -1249,6 +1296,12 @@ function RequestsPage() {
     if (!filters.model || modelOptions.includes(filters.model)) return modelOptions
     return [filters.model, ...modelOptions]
   }, [filters.model, modelOptions])
+  // 同上一取舍：Key 被删掉后（不在候选清单里）选中的 id 仍要留在下拉里，
+  // 否则筛选条件会静默消失而列表还是上一次的结果
+  const keySelectOptions = React.useMemo(() => {
+    if (!filters.key || keyOptions.some(item => item.value === filters.key)) return keyOptions
+    return [{ value: filters.key, label: filters.key }, ...keyOptions]
+  }, [filters.key, keyOptions])
 
   const rowKeys = uniqueRowKeys(data.entries)
   const rows = data.entries.map((entry, index) => (
@@ -1310,6 +1363,23 @@ function RequestsPage() {
             <SelectContent>
               <SelectItem value=''>{ALL_PROVIDER_LABEL}</SelectItem>
               {providerSelectOptions.map(option => (
+                <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <Select value={filters.key}
+            onValueChange={next => onSelectChange({ key: String(next ?? '') })}>
+            <SelectTrigger id='req-key' className='min-w-[120px]'
+              title={t('按网关 Key 筛选（只列日志里出现过的；精确匹配 Key）')} aria-label={t('按网关 Key 筛选')}>
+              <SelectValue>
+                {filters.key
+                  ? (keySelectOptions.find(item => item.value === filters.key)?.label || filters.key)
+                  : ALL_KEY_LABEL}
+              </SelectValue>
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value=''>{ALL_KEY_LABEL}</SelectItem>
+              {keySelectOptions.map(option => (
                 <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>
               ))}
             </SelectContent>

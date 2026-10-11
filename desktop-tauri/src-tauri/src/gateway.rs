@@ -261,6 +261,45 @@ pub async fn call_text(method: &str, path: &str) -> Result<String, String> {
         .map_err(|error| format!("读取响应失败: {error}"))
 }
 
+/// 发一次管理请求并**把响应体留在流里**（导出整库备份用）。
+///
+/// 与 [`call_text`] 的区别就是「不读 body」：整库备份可达数百 MB，`text()`
+/// 会把整份读进内存，而调用方（`commands::backup_database`）要的是逐块写盘。
+/// 之所以不直接返回 `reqwest::Response` 的 builder 让调用方自己发：
+/// `request_builder` 是私有的，且「带上 X-API-Key」这条不该由每个调用方各记一次。
+///
+/// ── 为什么超时不能沿用 `REQUEST_TIMEOUT_MS`（60 秒）────────────
+/// 那个超时是**整请求**的（reqwest 的 `timeout` 覆盖从连接建立到 body 读完），
+/// 而几百 MB 的库在慢盘 / 慢网络上可能远超 60 秒。这里另建一个不带总超时的
+/// 客户端：本地回环连接本身不会挂住，真出问题（网关没起来）时连接会被立即
+/// 拒绝而不是等超时，所以不设总超时是安全的。
+pub async fn get_stream(path: &str) -> Result<reqwest::Response, String> {
+    let url = format!("http://127.0.0.1:{}{path}", proxy_port());
+    let client = reqwest::Client::builder()
+        .build()
+        .map_err(|error| format!("创建 HTTP 客户端失败: {error}"))?;
+    let mut builder = client.get(&url).header("Accept", "application/octet-stream");
+    if let Some(key) = read_api_key() {
+        builder = builder.header("X-API-Key", key);
+    }
+    let response = builder
+        .send()
+        .await
+        .map_err(|error| describe_transport_error(&error))?;
+    if !response.status().is_success() {
+        // 失败响应一定是 JSON 错误（`api::db_api` 的 `raw_json`），读出来给用户看；
+        // 这里读 body 没有体积风险 —— 错误响应永远是几十字节
+        let status = response.status().as_u16();
+        let text = response.text().await.unwrap_or_default();
+        // 非 2xx 时 `unwrap_envelope` 必然返回 `Err`（它按状态码判失败）；
+        // `unwrap_or_else` 只是给「2xx 却读到错误」这个不可能分支一句兜底。
+        return Err(unwrap_envelope(&text, status)
+            .err()
+            .unwrap_or_else(|| format!("HTTP {status}")));
+    }
+    Ok(response)
+}
+
 fn describe_transport_error(error: &reqwest::Error) -> String {
     if error.is_timeout() {
         "连接本地代理超时".to_string()

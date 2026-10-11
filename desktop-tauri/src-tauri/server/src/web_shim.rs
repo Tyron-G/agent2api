@@ -31,7 +31,7 @@
 //!     HTTP 回调；Trae / Accio / CodeArts：网页端自动提供“粘贴回调地址”兜底。
 //!
 //! ── 壳特有命令的降级 ────────────────────────────────────────
-//! 窗口主题、托盘、改端口、软件更新安装、桌面设置、文件对话框导入导出
+//! 窗口主题、托盘、改端口、软件更新安装、桌面设置、文件对话框备份恢复
 //! 这些只有壳能做的事按「能映射则映射，不能则明确拒绝」处理：
 //! 拒绝给出可读文案（界面会 toast 出来），绝不静默假成功。
 
@@ -472,8 +472,11 @@ pub fn shim_js() -> &'static str {
       if (args && args.url) { try { window.open(args.url, '_blank'); } catch (e) { /* 无害 */ } }
       return Promise.resolve({ url: (args && args.url) || '' });
     },
-    export_accounts: function () {
-      return downloadFile('GET', '/api/accounts/export', 'agent2api-accounts.json');
+    export_database: function () {
+      // 整库备份：响应是**裸的 .db 文件**（不套 { success, data } 信封），
+      // 所以 `downloadFile` 里那段 JSON 剥信封的逻辑走 catch 分支、按原文存 ——
+      // 正是我们要的（见 downloadFile 的说明）。
+      return downloadFile('GET', '/api/db/backup', 'agent2api-backup.db');
     },
     export_logs: function () {
       return downloadFile('GET', '/api/logs/download', 'agent2api-logs.txt');
@@ -492,21 +495,9 @@ pub fn shim_js() -> &'static str {
     var response = await fetch(path, { method: method, headers: headers });
     if (!response.ok) throw new Error('导出失败（HTTP ' + response.status + '）');
     var blob = await response.blob();
-    // 管理 API 的响应带 { success, data } 信封：落盘前剥掉，存 data 本体 ——
-    // 与桌面端的导出文件同一格式；信封壳留着，这份文件导回去时顶层没有
-    // accounts，只会得到「缺少 accounts 字段」。顺带把账号数带回给调用方
-    //（设置页用它提示「已导出 N 个账号」，拿不到会误报「没有可导出的账号」）
+    // 现存的两个下载端点（整库备份 / 日志）回的都是**裸文件**，不是
+    // `{ success, data }` 信封，所以这里按原文存、不剥信封。
     var summary = {};
-    try {
-      var body = JSON.parse(await blob.text());
-      if (body && body.success === true && body.data && typeof body.data === 'object') {
-        var accounts = Array.isArray(body.data.accounts) ? body.data.accounts : null;
-        var providers = Array.isArray(body.data.customProviders) ? body.data.customProviders : null;
-        if (accounts) summary.count = accounts.length;
-        if (providers) summary.customProviders = providers.length;
-        blob = new Blob([JSON.stringify(body.data, null, 2)], { type: 'application/json' });
-      }
-    } catch (e) { /* 非 JSON 响应（日志下载）按原文保存 */ }
     var url = URL.createObjectURL(blob);
     var link = document.createElement('a');
     link.href = url;
@@ -516,6 +507,11 @@ pub fn shim_js() -> &'static str {
     link.remove();
     setTimeout(function () { URL.revokeObjectURL(url); }, 5000);
     summary.saved = true;
+    // 字节数与桌面壳的 `backup_database` 对齐：那边回 `{bytes, file}`，前端
+    // 的导出提示要摊出「（12.3 MB）」这一项。网页端**知道**大小（就在 Blob
+    // 上），不带上就等于让前端凭空少一截信息，只能退化成「不显示大小」的
+    // 分支 —— 那是两个端行为不一致，没必要。
+    summary.bytes = blob.size;
     return summary;
   }
 
@@ -523,8 +519,8 @@ pub fn shim_js() -> &'static str {
   function invokeShell(command, args) {
     var handler = shellCommands[command];
     if (handler) return handler(args);
-    // 文件对话框类：导入要走文件选择，单独给一条带输入框的链路
-    if (command === 'import_accounts') return importAccountsViaFile();
+    // 文件对话框类：恢复要走文件选择，单独给一条带输入框的链路
+    if (command === 'restore_database') return restoreDatabaseViaFile();
     return Promise.reject(new Error(
       command === 'download_update' || command === 'update_progress' || command === 'cancel_update'
       || command === 'run_installer'
@@ -533,20 +529,54 @@ pub fn shim_js() -> &'static str {
     ));
   }
 
-  async function importAccountsViaFile() {
+  /**
+   * 网页端的整库恢复：选文件 → **流式上传** → 后端落盘校验后自退，
+   * 由容器策略（compose 的 `restart: unless-stopped`）拉起并完成换库。
+   *
+   * ── 为什么用 fetch + body: file 而不是 FormData ────────────────
+   * 后端读的是 `request.into_body().into_data_stream()` —— 也就是**请求体本身**
+   * 就是那个 .db 文件。`fetch(path, { method: 'POST', body: file })` 正好如此
+   * （File 是可流式发送的 BodyInit，浏览器不会把它塞进 multipart 包装）。
+   * 用 FormData 反而要在服务端解析 multipart，凭空多一层。
+   *
+   * ── 为什么不用 file.text() ─────────────────────────────────────
+   * 库是二进制，`text()` 会按 UTF-8 解码、把非文本字节破坏掉（旧账号导入是
+   * JSON 才可以用 text()）。这里直接把 File 当请求体，浏览器按字节发。
+   *
+   * ── 为什么不设 Content-Type ────────────────────────────────────
+   * 后端不看它（只按字节落盘 + 读文件头）。设成 `application/octet-stream`
+   * 也无妨，但省略更省事、也不会误触发 CORS 预检之外的东西。
+   */
+  async function restoreDatabaseViaFile() {
     return new Promise(function (resolve, reject) {
       var input = document.createElement('input');
       input.type = 'file';
-      input.accept = '.json,application/json';
+      input.accept = '.db,application/vnd.sqlite3,application/octet-stream';
       input.style.display = 'none';
       input.addEventListener('change', async function () {
         var file = input.files && input.files[0];
         input.remove();
         if (!file) { reject(new Error('未选择文件')); return; }
         try {
-          var text = await file.text();
-          var payload = JSON.parse(text);
-          resolve(await call('POST', '/api/accounts/import', payload));
+          var headers = {};
+          if (apiKey) headers['x-api-key'] = apiKey;
+          var panelAccess = storedPanelToken('access');
+          if (panelAccess) {
+            headers['x-panel-token'] = panelAccess;
+            headers['Authorization'] = 'Bearer ' + panelAccess;
+          }
+          var response = await fetch('/api/db/restore', {
+            method: 'POST',
+            headers: headers,
+            body: file,
+          });
+          var text = await response.text();
+          var payload = {};
+          try { payload = JSON.parse(text); } catch (e) { /* 非 JSON 按原文报错 */ }
+          if (!response.ok || payload.success === false) {
+            throw new Error((payload && payload.error) || ('恢复失败（HTTP ' + response.status + '）'));
+          }
+          resolve(payload.data || { restarting: true });
         } catch (error) {
           reject(asError(error));
         }
@@ -1034,14 +1064,14 @@ pub fn shim_js() -> &'static str {
     windowIsMaximized: function () { return Promise.resolve(false); },
     onWindowResize: function () { return function () {}; },
 
-    // ── 应用设置与账号导入导出 ──
+    // ── 应用设置与数据库备份 / 恢复 ──
     getAppSettings: function () { return invokeShell('get_app_settings'); },
     saveAppSettings: function (patch) {
       // 无处持久化也不该报错：界面保存成功即可（本次会话内忽略）
       return Promise.resolve(Object.assign({ closeToTray: false, autostart: false, proxyPort: 0, lightweightMode: false }, patch));
     },
-    exportAccounts: function () { return invokeShell('export_accounts'); },
-    importAccounts: function () { return invokeShell('import_accounts'); },
+    backupDatabase: function () { return invokeShell('export_database'); },
+    restoreDatabase: function () { return invokeShell('restore_database'); },
   };
 
   // 把筛选条件转成查询串（与桌面 bridge 的 toQuery 同语义：空值跳过）

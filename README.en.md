@@ -39,6 +39,7 @@ The three chat entry points (`/v1/chat/completions`, `/v1/responses`, `/v1/messa
 - [Quick Start](#quick-start)
 - [Docker Deployment](#docker-deployment)
 - [Screenshots](#screenshots)
+- [Database backup / restore](#database-backup--restore)
 - [Project Layout](#project-layout)
 - [Development & Build](#development--build)
 - [Usage Notice](#usage-notice)
@@ -144,7 +145,7 @@ Pick a provider, then sign in; one vendor can hold several account versions (e.g
 
 ### Report
 
-Overview: requests / success rate / tokens / top model, with account and provider rankings, usage donuts and a 365-day activity heatmap:
+Overview: requests / success rate / tokens / top model, with account, provider and gateway key rankings, usage donuts and a 365-day activity heatmap:
 
 ![Report overview: stat cards, top accounts / providers, model and provider usage donuts](./assets/screenshots/report-overview.png)
 
@@ -157,6 +158,20 @@ Trends: 24-hour **cache hit rate** (line) and **token consumption** (area) on tw
 All background tasks live on one page (toggle / interval / last result / run now); the list is stored in `scheduledTasks` in `~/.agent2api/config.json` and edits apply immediately.
 
 ![Scheduled tasks page: toggles and intervals for check-in, credential maintenance, model catalog refresh and more](./assets/screenshots/scheduled-tasks.png)
+
+### Database backup / restore
+
+Under **Settings → Data** you can export and restore a **whole-database backup**: the export is a single `.db` file whose content is a complete snapshot of the entire `agent2api.db` (accounts, logs, statistics, gateway keys and panel settings included).
+
+- **Export**: the desktop app opens a native save dialog; the web panel downloads through the browser. The database can reach hundreds of MB (`request_raw` alone is capped around 512MB), so both sides stream — the whole file never enters memory.
+- **Restore**: pick a file on the desktop, upload one on the web. Restore is a **full replacement**, not a merge — the current database is overwritten entirely by the backup file, so:
+
+  - before restoring, the old database is saved as `agent2api.db.pre-restore` (overwritten in place, only one copy kept) so you can swap it back by hand if something goes wrong;
+  - after restoring, the app is **force-restarted** to complete the swap (the swap must happen before any database access). The desktop app restarts itself; Docker deployments come back via `restart: unless-stopped`, while a bare `docker run` (no `--restart`) needs a manual `docker compose up -d`.
+
+> ⚠️ **The old "account import / export" has been removed.** It was a JSON transfer merged by uid that depended on the upstream account identity structure; since reverse-proxy provider types and fields change often, that identity-normalisation logic kept falling behind upstream at a high maintenance cost. Whole-database backup/restore **understands none of the business semantics inside the database**, so upstream changes never touch it.
+>
+> The cost is that **cross-machine account merging is gone**: whole-database restore has replacement semantics, so "merge machine A's accounts into machine B" is no longer possible (merging is exactly what requires understanding account identity — the thing being dropped). cc-switch has the same replacement semantics.
 
 ---
 
@@ -279,13 +294,15 @@ agent2api/
 │  │  │  │  ├─ degrade.rs       Content-block degradation state (neutral prompt until next 00:00)
 │  │  │  │  ├─ credential_maintenance.rs  Batch refresh of expired / soon-to-expire credentials
 │  │  │  │  ├─ usage_query.rs     Balance / points queries (concurrent across accounts + the snapshot taken by the scheduled run)
-│  │  │  │  ├─ scheduled_tasks.rs  Interval-based scheduled task registry and dispatch loop (toggle / interval /
+│  │  │  │  └─ scheduled_tasks.rs  Interval-based scheduled task registry and dispatch loop (toggle / interval /
 │  │  │  │  │                       last result; configured under scheduledTasks in config.json)
-│  │  │  │  └─ account_transfer.rs + account_transfer/ / auto_checkin.rs / update/
-│  │  │  │                       Import/export (with identity normalization) / scheduled check-in / software updates
+│  │  │  │  └─ auto_checkin.rs / update/   Scheduled check-in / software updates
+│  │  │  ├─ db/                  Single source of truth for local storage: one SQLite file
+│  │  │  │                     (connection & handle / DDL & version upgrades / one-off
+│  │  │  │                     migration from legacy files / whole-DB backup & restore)
 │  │  │  └─ api/                 Per-route handlers (health/session/accounts/accounts_usage/
 │  │  │                          chat/models/keys/model_manage/stats/logs/billing/
-│  │  │                          sanitize/prompt/auto-checkin/scheduled-tasks/update/…)
+│  │  │                          sanitize/prompt/auto-checkin/scheduled-tasks/update/db/…)
 │  │  ├─ lib.rs                  App entry point (config directory migration → settings → tray → main window → start backend)
 │  │  ├─ backend.rs              In-process server lifecycle
 │  │  ├─ legacy_install.rs       Cleanup of the old "current user" install (directory / shortcuts / uninstall entry / autostart; release only)
@@ -342,7 +359,7 @@ Do not use this project for any commercial purpose, for redistributing it for pr
 
 ### Credentials and data risk
 
-This project stores account credentials (`accessToken` / `refreshToken`, etc.) as **plain text** in the local configuration directory (by default `~/.agent2api/`), and files produced by the export feature contain plain-text credentials as well. Keep them safe: never commit them to a public repository, upload them to cloud storage or share them with others. Losses caused by leaked credentials are borne by the user.
+This project stores account credentials (`accessToken` / `refreshToken`, etc.) as **plain text** in the SQLite database `agent2api.db` inside the local configuration directory (by default `~/.agent2api/`), and the `.db` file exported by the whole-database backup is a **complete copy of that database** — besides account credentials it also contains gateway Keys, custom provider definitions, the panel administrator's password hash and the login CAPTCHA (ALTCHA) key. In other words, holding this backup is equivalent to holding **every identity and setting** of this instance: keep it safe, and never commit it to a public repository, upload it to cloud storage or share it with others. Losses caused by leaked credentials are borne by the user.
 
 ### No warranty and rights notice
 
