@@ -48,6 +48,19 @@ use crate::server::core::api_keys::ApiKeyEntry;
 /// （模型名、provider id 的比对历来忽略大小写，见 `model_rules` 模块头）。
 #[derive(Clone, Debug, Default)]
 pub struct KeyScope {
+    /// 命中的那把 Key 的 id（`ApiKeyEntry.id`）；空串 = 没有对应的记录。
+    ///
+    /// 与两个白名单不同，这个字段**不参与任何判定** —— 它只被带去记账
+    /// （`requests.key_id`），用来回答「这次调用用的是哪把 Key」。之所以挂在
+    /// 这里而不是另起一个请求扩展类型：中间件本来就已经把 `KeyScope` 放进
+    /// 扩展了，而构造它的那一刻 `ApiKeyEntry` 正在手里 —— 再多塞一个扩展
+    /// 意味着两处写入、两处读取，还会多出一种「有一个没有另一个」的中间态。
+    ///
+    /// 空串的三种情形（都**不是**错误，记账侧照写空串）：
+    /// 免鉴权模式（中间件直接放行，本类型根本不进扩展）、环境变量 Key
+    /// （`api_keys::entry_for_key_from` 显式返回 None，没有列表记录可挂 id）、
+    /// `provider_only` 构造的测试用 scope（那是管理端发起的模型测试，无 Key）。
+    id: String,
     /// 允许的 provider id（小写），空集合 = 不限制
     allowed_providers: HashSet<String>,
     /// 允许的对外模型名（小写），空集合 = 不限制
@@ -58,9 +71,15 @@ impl KeyScope {
     /// 由一条 Key 记录构造（`allowed*` 为空 = 该维度不限制）
     pub fn from_entry(entry: &ApiKeyEntry) -> Self {
         Self {
+            id: entry.id.clone(),
             allowed_providers: normalize(&entry.allowed_providers),
             allowed_models: normalize(&entry.allowed_models),
         }
+    }
+
+    /// 命中的 Key id（空串 = 没有对应记录，见字段说明）。记账侧唯一的读取点。
+    pub fn key_id(&self) -> &str {
+        &self.id
     }
 
     /// **只有这一家**（模型测试专用：测试要打在**这一行所属的家**上，
@@ -76,6 +95,9 @@ impl KeyScope {
             allowed_providers.insert(id);
         }
         Self {
+            // 模型测试由管理端发起，不经过 `require_api_key` 的 Key 匹配，
+            // 因此没有可归因的 Key —— 记账时这一维留空串（见 `id` 字段说明）。
+            id: String::new(),
             allowed_providers,
             allowed_models: HashSet::new(),
         }

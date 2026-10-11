@@ -391,6 +391,13 @@ pub struct RecordContext {
     /// 同形，唯一的分野就是「谁发起的」—— 存档时要能把它标出来（报表排除、
     /// 请求日志标记）。
     pub is_test: bool,
+    /// 这次调用命中的网关 Key id（空串 = 未归因，见
+    /// `request_stats::RequestEntry::key_id`）。
+    ///
+    /// 由入口 handler 从中间件放进扩展的 `KeyScope` 上取（`KeyScope::key_id`）——
+    /// 记账点本身够不着请求头，也不该为了一列去够。与 `is_test` 同为「只有入口
+    /// 才知道的事实」，所以同样在构造 `RecordContext` 时定稿。
+    pub key_id: String,
 }
 
 /// 把原始字节变成可入库的正文文本（请求侧 / 响应侧共用）。
@@ -426,6 +433,7 @@ pub fn record_early_failure(
     model: &str,
     client_reasoning: &str,
     error: &GatewayError,
+    key_id: &str,
 ) {
     let context = RecordContext {
         stats: state.request_stats(),
@@ -442,6 +450,8 @@ pub fn record_early_failure(
         raw_response: None,
         // 早失败路径只有真实流量会走（模型测试自己那条失败在 handler 里收尾）
         is_test: false,
+        // 但**可能**带了 Key：请求体非法也是「某把 Key 发来的」，照样该归因
+        key_id: key_id.to_string(),
     };
     record_entry(&context, Some(error.message.clone()));
 }
@@ -599,6 +609,8 @@ pub fn record_entry(context: &RecordContext, fallback_error: Option<String>) {
     entry.sensitive_hits = stored_sensitive_hits(&snapshot.sensitive_hits);
     // 来源标记：入口带进来的事实，存储层据此排除报表聚合（见该字段的说明）
     entry.is_test = context.is_test;
+    // 归因 Key：同样是入口带进来的事实（中间件的 Key 匹配结果），存储层只搬运
+    entry.key_id = context.key_id.clone();
     entry.error = error;
     entry.prompt_tokens = snapshot.prompt_tokens;
     entry.completion_tokens = snapshot.completion_tokens;
@@ -1033,7 +1045,7 @@ mod tests {
     //! 「失败清零」抹掉用量（生产上 1176 行就是这个形状）；多认 ⇒ 把真实
     //! 中断洗成成功（报表再也看不出断流）。所以这一组用例两头都要钉住。
 
-    use super::{terminal, RecordContext, RecordingStream, TerminalFrames, TerminalScan};
+    use super::{record_entry, terminal, RecordContext, RecordingStream, TerminalFrames, TerminalScan};
 
     /// 生产实测到的收尾帧写法（CodeArts 走字节透传，上游发什么就下发什么）：
     /// 冒号后面**没有**那个空格。取自 `request_raw.response_body` 的真实尾巴。
@@ -1192,6 +1204,9 @@ mod tests {
             status: 200,
             raw_request: None,
             raw_response: None,
+            // 归因 Key：本用例只关心 token 累计与终态，不涉归因，给空串
+            // （要验 key_id 落库的用例自己改这一格，见 `key_id_round_trip`）
+            key_id: String::new(),
         };
         (context, telemetry)
     }
@@ -1212,6 +1227,7 @@ mod tests {
             limit: Some(5),
             model: None,
             provider: None,
+            key_id: None,
             status: None,
             start: None,
             end: None,
@@ -1280,5 +1296,137 @@ mod tests {
         let error = row["error"].as_str().unwrap_or("");
         assert!(error.contains("未完整下发"), "真中断必须留摘要：{row}");
         assert_eq!(row["promptTokens"], Value::from(0), "失败的行按契约清零：{row}");
+    }
+
+    // ── 归因 Key 落库（schema v10）──────────────────────────────
+    //
+    // `key_id` 与上面那组字段有一处结构上的不同：**主路径的行是转发开始前
+    // 插的**（`record_started` → `insert_started_request`），收尾只是 UPDATE。
+    // 所以只改收尾侧会让主路径永远写不进这一列，而且**编译期发现不了** ——
+    // 参数照样传、SQL 照样跑，只是那一列一直是空串。这条用例钉的就是它：
+    // 走完整的两段路径，再从库里读回来对质。
+
+    /// 带 Key 的上下文（其余字段照 `context_for` 的生产实测读数）
+    fn context_for_key(stats: Arc<RequestStats>, key_id: &str) -> (RecordContext, Arc<RequestTelemetry>) {
+        let (mut context, telemetry) = context_for(stats);
+        context.key_id = key_id.to_string();
+        (context, telemetry)
+    }
+
+    /// 主路径往返：开始前插进行中行（带 key_id）、收尾 UPDATE（也带 key_id），
+    /// 两条路径都必须把同一个 id 写进去 —— 只改一侧时这条会红。
+    #[tokio::test]
+    async fn key_id_round_trip() {
+        const KEY_ID: &str = "key_abc123";
+        let (stats, _dir) = temp_stats("key-id");
+        // **必须先走一次启动清扫**（生产里 `server::mod` 启动时调，
+        // 见 `RequestStats::sweep_stale_running`）：它会把 `stale_cutoff()`
+        // 的 `process_started_at` 钉在「建库那一刻」。少了这一步，本用例第一次
+        // 触发 `stale_cutoff()` 就是下面那次 `record_started` —— 而它发生在
+        // 插入之后，于是阈值等于「此刻」，刚插进去的进行中行（ts = 此刻）会被
+        // 自己那次顺手清扫判成孤儿、补成 408，一行变两行。这不是被测代码的问题，
+        // 是生产启动顺序在用例里缺了一环。
+        stats.sweep_stale_running();
+        let (context, _telemetry) = context_for_key(stats.clone(), KEY_ID);
+        // 主路径的两段：与 `api::chat` / `api::protocol` 的调用顺序一致
+        let request_id = "req-key-id-round-trip";
+        context.telemetry.ensure_id(request_id);
+        stats.record_started(
+            request_id,
+            context.started_at,
+            &context.model,
+            &context.client_model,
+            &context.client_reasoning,
+            context.is_test,
+            &context.key_id,
+        );
+        record_entry(&context, None);
+
+        let row = only_row(&stats);
+        assert_eq!(
+            row["keyId"], Value::from(KEY_ID),
+            "主路径（先插后 UPDATE）必须把 Key id 落进库：{row}"
+        );
+
+        // 按 Key 筛得出来（接口层的 `keyId` 查询参数走的就是这一支）
+        let filtered = stats.query_requests(&RequestQuery {
+            offset: 0,
+            limit: Some(5),
+            model: None,
+            provider: None,
+            key_id: Some(KEY_ID.to_string()),
+            status: None,
+            start: None,
+            end: None,
+        });
+        let hits = filtered
+            .get("entries")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or(0);
+        assert_eq!(hits, 1, "按本 Key 筛应当恰好回这一条：{filtered}");
+
+        // 换一把 Key 筛 ⇒ 一条都不该回（精确匹配，不是模糊）
+        let other = stats.query_requests(&RequestQuery {
+            offset: 0,
+            limit: Some(5),
+            model: None,
+            provider: None,
+            key_id: Some("key_other".to_string()),
+            status: None,
+            start: None,
+            end: None,
+        });
+        let other_hits = other
+            .get("entries")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or(0);
+        assert_eq!(other_hits, 0, "别的 Key 不该命中：{other}");
+    }
+
+    /// 反例：未归因的请求（免鉴权 / 环境变量 Key / 模型测试）写空串，不报错、
+    /// 也不漏行。这一格与上面那条**必须成对** —— 少了它，「写进去」可能只是
+    /// 某个默认值恰好等于测试里那把 Key。
+    #[tokio::test]
+    async fn unattributed_request_stores_empty_key_id() {
+        let (stats, _dir) = temp_stats("no-key");
+        // 同 `key_id_round_trip`：先把启动清扫走一遍，钉住孤儿判定阈值
+        stats.sweep_stale_running();
+        let (context, _telemetry) = context_for(stats.clone());
+        assert!(context.key_id.is_empty(), "本用例的前提就是没有 Key");
+        let request_id = "req-no-key";
+        context.telemetry.ensure_id(request_id);
+        stats.record_started(
+            request_id,
+            context.started_at,
+            &context.model,
+            &context.client_model,
+            &context.client_reasoning,
+            context.is_test,
+            &context.key_id,
+        );
+        record_entry(&context, None);
+
+        let row = only_row(&stats);
+        assert_eq!(row["keyId"], Value::from(""), "未归因必须是空串：{row}");
+
+        // 空串当「没筛」——界面的下拉里空 id 本来也不出现，同一口径
+        let all = stats.query_requests(&RequestQuery {
+            offset: 0,
+            limit: Some(5),
+            model: None,
+            provider: None,
+            key_id: Some(String::new()),
+            status: None,
+            start: None,
+            end: None,
+        });
+        let hits = all
+            .get("entries")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or(0);
+        assert_eq!(hits, 1, "空串等于没筛，这条必须还在：{all}");
     }
 }

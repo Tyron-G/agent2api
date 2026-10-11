@@ -32,28 +32,26 @@ export type AppSettings = {
   lightweightMode: boolean
 }
 
-/** 导入失败项：customProvider 标记的那条不是账号，是自定义提供商定义 */
-export type ImportError = { id?: string; message?: string; customProvider?: boolean }
-
-/** 导入结果（壳命令 import_accounts） */
-export type ImportResult = {
+/** 导出结果（壳命令 backup_database） */
+export type BackupResult = {
   canceled?: boolean
-  total?: number
-  added?: number
-  updated?: number
-  skipped?: number
-  failed?: number
-  errors?: ImportError[]
-  /** v2 导出文件附带的自定义提供商定义统计 */
-  customProviders?: { added?: number; updated?: number }
+  /** 写入的字节数。桌面壳由 `write_response_stream` 统计后回传；网页端由
+   * `downloadFile` 从 `blob.size` 带回来 —— 两端都有，缺了才是不正常。 */
+  bytes?: number
+  file?: string
 }
 
-/** 导出结果（壳命令 export_accounts） */
-export type ExportResult = {
+/** 恢复结果（壳命令 restore_database）。成功后应用会重启，所以只有一个标志 */
+export type RestoreResult = {
   canceled?: boolean
-  count?: number
-  /** v2 导出文件附带的自定义提供商定义条数 */
-  customProviders?: number
+  /**
+   * 是否已触发自退重启。**可能为 `false`** —— 后端拿不到停机句柄时会如实回
+   * `false` 并给出 `note`（此时备份已就绪，但必须人工重启）。前端据此提示，
+   * 不能无条件说「正在重启」。
+   */
+  restarting?: boolean
+  /** 后端给的补充说明（`restarting: false` 时是「请手动重启」的具体指引） */
+  note?: string
   file?: string
 }
 
@@ -115,8 +113,8 @@ export type SettingsBridge = {
   platform?: string
   getAppSettings(): Promise<AppSettings | null | undefined>
   saveAppSettings(patch: AppSettings): Promise<AppSettings | null | undefined>
-  exportAccounts(): Promise<ExportResult | null | undefined>
-  importAccounts(): Promise<ImportResult | null | undefined>
+  backupDatabase(): Promise<BackupResult | null | undefined>
+  restoreDatabase(): Promise<RestoreResult | null | undefined>
   getRetention(): Promise<unknown>
   saveRetention(patch: Record<string, number>): Promise<unknown>
   getRetry(): Promise<unknown>
@@ -596,7 +594,7 @@ export const TIPS = {
   cors: t('网关面（/v1/*）默认不应答浏览器跨源请求：页面直连会被预检拦下，只报「无法连接 API」。注意来源是 * —— 未配「网关 Key」时任何网页都能借本机网关打上游，故默认关闭；只给自己用的话，让页面与网关同源（本地反代 /v1）更稳妥。面板接口（/api/*）不受影响。'),
   prompt: t('客户端（Claude Code / Codex 等 CLI）会在 system 提示词里注入几十句固定模板，上游按逐字匹配审核，命中就整单拦截（HTTP 400）。指纹脱敏能改写实测命中过的那几句，但换一个客户端版本就可能冒出新的。这里可以把 system 整段换成网关自己那份：①「透传」= 不动客户端 system（默认，行为与之前完全一致）；②「替换」= 删掉客户端所有 system / developer 消息，换成网关的提示词（客户端项目规范随之消失）；③「追加」= 在开头连续 system 块之后插入一条网关提示词，既有消息逐字不动（客户端规范与网关提示词并用）。那份提示词有两个来源：提示词文件（留空用内置默认），或直接在界面上编辑正文 —— 编辑过就以那份正文为准（优先于文件），清空则回到文件 / 内置默认。另外，透传 / 追加模式下撞了内容拦截（多半是指纹误报）时，网关会自动换一段最小中性提示词重试一次，并把「降级期」开到次日 00:00 —— 期间所有请求直接带中性提示词出门，不再先撞一次 400；这里能看见并提前解除它。上面几项是**默认值**：想给某个提供商单独配，用下面的「按提供商」加一行（带「网关自带」的家默认就列在那里）—— 不同的上游对这些内容的接受程度不一样。'),
   debug: t('开启后，网关会把每次转发**发给上游的请求**（请求头 + 请求体）与**上游返回的响应**（状态码 + 响应头 + 响应体）完整保存到本地，供请求日志页的「详情」查看。请求头里的 Authorization、Cookie、API Key 等凭据字段一律替换成 [redacted]，不会明文落盘；请求体与响应体按原样保存（可能包含你的对话内容）。报文只保留最近 500 条，超出后丢弃最旧的。这是排障用的临时开关，不需要时建议关闭。'),
-  io: t('导出会把全部账号与自定义提供商定义写入一个 JSON 文件，可以拷到另一台机器上导入后继续使用。导入采用合并策略：同提供商下按业务身份（UID / userId / apiKey 等）去重 —— 已存在的账号只更新凭证，保留本机原有的优先级顺序；新账号追加到转发顺序末尾，不会抢占当前正在使用的账号；自定义提供商定义按 id 合并，本机缺失时自动补建。'),
+  io: t('导出会把整个数据库打包成一个 SQLite 文件，里面包含全部账号凭证、网关 Key、自定义提供商定义与面板管理员密码哈希，可以拷到另一台机器上恢复后继续使用。恢复是**整体替换**语义：备份文件会完全覆盖当前数据库，本机现有的账号、日志、统计与设置都会被替换掉（恢复前会自动留一份替换前的副本）。恢复后应用会立即重启。'),
   retention: t('三类数据各自独立计时，超出保留天数的部分会被删除：事件日志是登录、账号切换、429 切换这类系统事件；请求日志是网关每次转发到上游的逐条记录；按天聚合供报表页的热力图与按天趋势使用。把某一档改小（例如 30 天改成 7 天）保存后会立即删除超出的历史数据，此操作不可恢复；改大或保持不变不会删除任何数据。三项的可填范围均为 1–3650 天。'),
   storage: t('全部数据（账号、事件日志、请求记录、调试报文、设置）统一保存在配置目录下的 agent2api.db 这一个 SQLite 数据库里。备份时只需拷贝这个文件；更换保存位置请设置环境变量 AGENT2API_PROXY_HOME 后重启程序。'),
 } as const
@@ -623,7 +621,6 @@ export const NOTES = {
   storage: t('数据统一保存在配置目录下的 agent2api.db；如需更换位置，请设置环境变量 AGENT2API_PROXY_HOME 后重启程序。'),
   captcha: t('开启后，登录页在浏览器后台自动完成验证（对真人无感），而脚本每次尝试都要先算一道题 —— 暴力破解与抢注的成本显著上升。仅影响面板的登录 / 注册，与 API 客户端的 API Key 无关。'),
   panelLogin: t('当前浏览器以管理员身份登录着本面板。「退出登录」会撤销这台设备的登录会话（30 天内的自动续期一并失效），需要重新输入账号密码；其他已登录的设备不受影响。'),
-  exportDanger: t('导出文件内含 accessToken / refreshToken / apiKey 等凭证与自定义提供商定义，可直接用于登录。请妥善保管，不要外传或上传到公共位置。'),
 } as const
 
 /** 状态行（`.settings-state`）的派生文案：与旧实现的赋值逐字一致 */

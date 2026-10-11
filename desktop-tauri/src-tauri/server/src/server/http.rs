@@ -24,9 +24,9 @@
 //! 分组写法更贴近这个语义，新增路由时也不会忘记加检查（放错组一眼能看出来）。
 //!
 //! ── 路由匹配的一个坑 ──────────────────────────────────────
-//! `/api/accounts/{id}` 与 `/api/accounts/export` 这类静态子路径在同一个
+//! `/api/accounts/{id}` 与 `/api/accounts/current` 这类静态子路径在同一个
 //! Router 里必须共存：matchit 的优先级是「静态 > 参数」，所以不用像 Node 版
-//! 那样靠代码顺序保证 export/import 不被当成账号 id —— 但也**不能**注册
+//! 那样靠代码顺序保证固定子路径不被当成账号 id —— 但也**不能**注册
 //! `/api/accounts/{*rest}` 这种通配（它会与方法不匹配检查互相干扰）。
 //! 因此这里把每条子路径显式列出来。
 
@@ -285,6 +285,22 @@ pub fn panel_router(state: ServerState) -> Router {
         // 改造前的两条写路由（relocate / progress）随「三类数据各自一个目录」
         // 的语义一起删除，理由见 `api::storage_api` 的模块头。
         .route("/api/storage", get(api::storage_api::get_storage))
+        // ── 整库备份 / 恢复（替换旧的账号导入导出）──
+        // 导出整个 SQLite 库；恢复时用上传的备份整体替换主库并重启进程。
+        // 挂 protected 的理由比 /api/storage 更强：备份文件里有**全部账号凭证 +
+        // 面板管理员 bcrypt 哈希 + 网关 Key + ALTCHA 密钥**，泄漏面远大于
+        // 旧的账号 JSON 导出（见 `api::db_api` 模块头）。
+        //
+        // 恢复那条**单独放宽 body 上限**：全局是 `MAX_BODY_SIZE`（32MB），
+        // 而库可达数百 MB。`DefaultBodyLimit` 是按路由层叠的（外层那个
+        // `.layer(DefaultBodyLimit::max(MAX_BODY_SIZE))` 在 `router()` 末尾，
+        // 网关面另有 `.disable()` 的先例），所以逐路由覆盖是框架原生能力 ——
+        // 不必动全局上限，也就不会顺带放大其它管理接口的入口。
+        .route("/api/db/backup", get(api::db_api::backup_database))
+        .route(
+            "/api/db/restore",
+            post(api::db_api::restore_database).layer(api::db_api::restore_body_limit()),
+        )
         // ── 数据结构升级（旧 JSON/JSONL → 统一 SQLite 库）──
         // 启动时**不自动迁移**，由用户在弹窗里点「升级」触发（需求：必须让用户
         // 知道数据换了存储形态、旧数据保留）。挂 protected：run 会写库里的
@@ -294,7 +310,7 @@ pub fn panel_router(state: ServerState) -> Router {
         // ── 账号管理（对照 workbuddy-account-routes.mjs）──
         // 用 any(...) 注册两条入口（无尾段 + 通配尾段），方法/路径的判定交给
         // api::accounts::dispatch —— 这是为了复刻 Node 版 tryHandle 的判定顺序
-        // （见那边的注释：`DELETE /api/accounts/export` 会被当成账号 id）。
+        // （见那边的注释：`DELETE /api/accounts/current` 会被当成账号 id）。
         // axum 的静态路由 + {id} 写法会把这类组合拆成 405，与 Node 分叉。
         // 单独登记尾斜杠形态：`/api/accounts/` 在 axum 的 `{*rest}` 里匹配不上
         // （通配要求至少一个非空段），不登记就会落到全局 404（OpenAI 形状），

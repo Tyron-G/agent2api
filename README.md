@@ -39,6 +39,7 @@
 - [快速开始](#快速开始)
 - [Docker 部署](#docker-部署)
 - [界面预览](#界面预览)
+- [数据库备份 / 恢复](#数据库备份--恢复)
 - [项目结构](#项目结构)
 - [开发与构建](#开发与构建)
 - [使用声明](#使用声明)
@@ -144,9 +145,9 @@ services:
 
 ### 报表
 
-概览：请求数 / 成功率 / Token 总量 / Top 模型与账号、提供商排名，附用量环图与 365 天活跃热力图：
+概览：请求数 / 成功率 / Token 总量 / Top 模型、账号、提供商与网关 Key 排名，附用量环图与 365 天活跃热力图：
 
-![报表概览：统计卡片、Top 账号 / 提供商、模型与提供商用量环形图](./assets/screenshots/report-overview.png)
+![报表概览：统计卡片、Top 账号 / 提供商 / 网关 Key、模型与提供商用量环形图](./assets/screenshots/report-overview.png)
 
 趋势：24 小时**缓存命中率**（折线）与 **Token 消耗**（面积）双轴同图，底部按天 Token 柱状图：
 
@@ -157,6 +158,20 @@ services:
 后台任务统一在这一页（开关 / 间隔 / 上次结果 / 立即执行）；清单存在 `~/.agent2api/config.json` 的 `scheduledTasks`，改动即时生效。
 
 ![定时任务页：自动签到、凭证维护、模型目录刷新等后台任务的开关与间隔](./assets/screenshots/scheduled-tasks.png)
+
+### 数据库备份 / 恢复
+
+「设置 → 数据」里可以导出与恢复**整库备份**：导出的是一份 `.db` 文件，内容就是整个 `agent2api.db` 的完整快照（账号、日志、统计、网关 Key、面板设置全在里面）。
+
+- **导出**：桌面端弹系统保存框、网页端走浏览器下载。库可达数百 MB（`request_raw` 一张表上限约 512MB），两端都是流式收发，不会把整库读进内存。
+- **恢复**：桌面端选文件、网页端上传。恢复是**整体替换**，不是合并 —— 当前库会被备份文件整个覆盖，因此：
+
+  - 恢复前会自动把旧库另存为 `agent2api.db.pre-restore`（同名覆盖，只留一份），出问题可以拿它手工换回去；
+  - 恢复后会**强制重启**应用以完成换库（换库必须在任何数据库访问之前发生）。桌面端自动重启；Docker 部署靠 `restart: unless-stopped` 自动拉起，`docker run` 裸跑（没有 `--restart`）则需手动 `docker compose up -d`。
+
+> ⚠️ **旧版的「账号导入 / 导出」已移除**。它是按 uid 合并的 JSON 传输，依赖上游的账号身份结构，而反代提供商的类型与字段经常变动，那套身份归一逻辑持续落后于上游、维护成本高。整库备份/恢复**不理解库里的任何业务语义**，上游怎么变都不用改。
+>
+> 代价是**跨机合并账号的能力没有了**：整库恢复是替换语义，「把 A 机器的账号并到 B 机器」以后做不到（合并恰恰需要理解账号身份，而那正是要抛弃的东西）。cc-switch 同样是替换语义。
 
 ---
 
@@ -278,11 +293,12 @@ agent2api/
 │  │  │  │  ├─ usage_query.rs     余额 / 积分查询（跨账号并发 + 定时那一轮的快照）
 │  │  │  │  ├─ scheduled_tasks.rs  间隔型定时任务注册表与调度循环（开关 / 间隔 /
 │  │  │  │  │                      上次结果；配置在 config.json 的 scheduledTasks）
-│  │  │  │  └─ account_transfer.rs + account_transfer/ / auto_checkin.rs / update/
-│  │  │  │                       导入导出（含身份归一）/ 定时签到 / 软件更新
+│  │  │  │  └─ auto_checkin.rs / update/   定时签到 / 软件更新
+│  │  │  ├─ db/                 本地存储唯一真相：单文件 SQLite（连接与句柄 / 建表与
+│  │  │  │                      版本升级 / 旧文件一次性迁移 / 整库备份与恢复）
 │  │  │  └─ api/                 各路由 handler（health/session/accounts/accounts_usage/
 │  │  │                          chat/models/keys/model_manage/stats/logs/billing/
-│  │  │                          sanitize/prompt/auto-checkin/scheduled-tasks/update/…）
+│  │  │                          sanitize/prompt/auto-checkin/scheduled-tasks/update/db/…）
 │  │  ├─ lib.rs                 应用入口（配置目录迁移 → 设置 → 托盘 → 主窗口 → 启动后端）
 │  │  ├─ backend.rs              进程内服务器生命周期
 │  │  ├─ legacy_install.rs       旧「当前用户」安装的清理（目录 / 快捷方式 / 卸载项 / 自启；仅 release）
@@ -342,7 +358,7 @@ npm run build:icon         # 生成图标源图（改图标设计后执行，再
 
 ### 凭证与数据风险
 
-本项目会把账号凭证（`accessToken` / `refreshToken` 等）以**明文**形式保存在本机配置目录（默认 `~/.agent2api/`）中，导出功能生成的文件同样包含明文凭证。请自行妥善保管，切勿提交到公开仓库、上传到网盘或分享给他人。因凭证泄露造成的损失由使用者自行承担。
+本项目会把账号凭证（`accessToken` / `refreshToken` 等）以**明文**形式保存在本机配置目录（默认 `~/.agent2api/`）的 SQLite 数据库 `agent2api.db` 中，而整库备份导出的 `.db` 文件是**整个数据库的完整副本** —— 除了账号凭证，还包含网关 Key、自定义提供商定义、面板管理员密码哈希与登录人机验证（ALTCHA）密钥。换句话说，拿到这份备份就等于拿到了这个实例的**全部身份与配置**：请自行妥善保管，切勿提交到公开仓库、上传到网盘或分享给他人。因凭证泄露造成的损失由使用者自行承担。
 
 ### 无担保与权利通知
 

@@ -58,6 +58,7 @@
 //!     update.rs     /api/update/*（软件更新检查 / 下载 / 进度 / 取消）
 //!     endpoints.rs  GET /api/endpoints（接口清单）
 //!     storage_api.rs GET /api/storage（统一库的位置、大小与各表条数，只读）
+//!     db_api.rs     GET /api/db/backup、POST /api/db/restore（整库 SQLite 备份 / 恢复）
 //!     upgrade_api.rs GET /api/upgrade、POST /api/upgrade/run（旧数据 → SQLite 库）
 //!   core/
 //!     endpoints.rs 端点/版本/UA/上下文（唯一事实来源）
@@ -65,7 +66,6 @@
 //!                 持久化已从 `{config_dir}/accounts.json` 换到
 //!                 `agent2api.db` 的 `accounts` 表；`sql.rs` 是行级访问层，
 //!                 `store_view.rs` 是公开形态与快照
-//!     account_transfer.rs  账号导入导出
 //!     auth.rs      会话读取、getStatus、鉴权头、token 刷新
 //!     auth_http.rs 上游请求发送与解包（管理接口）+ 鉴权错误类型
 //!     login.rs     无头登录与登录任务表
@@ -248,6 +248,52 @@ pub struct ServerState {
     /// 不会被感知**（要下次启动才发现）—— 这是可接受的：手工放回文件的人
     /// 本来就知道自己在做什么。
     upgrade_pending: Arc<AtomicBool>,
+    /// 「进程自退」的停机信号发送端，由 [`start`] 在 bind 成功后写入。
+    ///
+    /// ── 为什么它必须活在 `ServerState` 里 ────────────────────────
+    /// 整库恢复（`api::db_api::restore_database`）要在**响应发出去之后**让本进程
+    /// 干净退出，好让容器策略（`docker-compose.yml` 的 `restart: unless-stopped`）
+    /// 拉起新进程，由启动期的 `db::restore::apply_pending()` 完成换库。
+    /// 而 handler 手里只有 `ServerState` 的克隆，拿不到 `start` 的局部变量 ——
+    /// 所以句柄得放进来。桌面壳本来就在 `AppState.backend` 里存了一份同类句柄
+    /// （`src/state.rs` 的 `BackendHandle::shutdown_tx`），但那是**壳侧**的，
+    /// server crate 够不着（依赖方向是壳 → server，反过来不行）。
+    ///
+    /// ── 为什么是**另一条** oneshot，而不是把 `start` 那条存进来 ──
+    /// `oneshot::Sender` 不可克隆，而 `start` 必须把它**原样返回**给既有调用方
+    /// （桌面壳的 `backend::shutdown` 与 headless 的 SIGTERM 收尾都靠它，签名
+    /// 一动就是两处无关改动）。所以在 `start` 里多开一条同向的 oneshot，
+    /// 由那个既有的协调任务 `select!` 两条一起等 —— 两条信号汇进同一个
+    /// `stop_tx` 广播，下游的优雅停机路径**逐字不变**。
+    ///
+    /// ── 为什么是 `Mutex<Option<..>>` 而不是裸字段 ────────────────
+    /// `ServerState` 是 `Clone` 的，且这是**唯一**一个需要在启动后被改的字段
+    /// （`upgrade_pending` 用 `Arc<AtomicBool>` 解决同一问题，但那里的值是可复制的
+    /// 布尔，这里是要被**取走**的 `oneshot::Sender`）。`Arc<Mutex<Option<..>>>`
+    /// 让所有克隆共享同一个槽位：`take_self_exit()` 取走一次，之后所有克隆都拿到
+    /// `None` —— 这正是自退想要的幂等语义（两个请求同时点恢复，只有一个能触发退出）。
+    ///
+    /// 锁中毒按「拿不到句柄」处理（返回 `None`），与 `Db::with` 的取向一致：
+    /// 这不是需要接管继续用的自管理状态，而是「自退句柄还在不在」的查询。
+    self_exit: Arc<std::sync::Mutex<Option<oneshot::Sender<()>>>>,
+
+    /// 自退的**进程级**信号（headless 专用）。
+    ///
+    /// ── 为什么单靠上面那条 oneshot 不够 ──────────────────────────
+    /// 那条 oneshot 汇进 `stop_tx` 后只驱动 **axum 优雅停机**（释放端口、
+    /// 跑完在途请求），它**不会让 `main` 返回** —— headless 的 `main` 阻塞在
+    /// `wait_for_shutdown_signal()`（只等 Ctrl+C / SIGTERM）。于是 Docker 形态下
+    /// 走网页端恢复时：HTTP 停了、面板 502，但进程还活着，容器的
+    /// `restart: unless-stopped` 只重启**已退出**的进程 → 不会拉起 →
+    /// `apply_pending()` 永远不执行 → 恢复静默失败且服务停摆。
+    /// 桌面壳不受影响：它走自己的 `schedule_app_restart`，不读这条信号。
+    ///
+    /// ── 为什么是 `Notify` 而不是再开一条 oneshot ─────────────────
+    /// 这条信号只被 headless 的 `main` 等一次，且**谁都能发、发多次无害**
+    /// （`notify_one` 最多存一个许可）。`oneshot::Sender` 不可克隆、发一次就没了，
+    /// 不适合「只是喊一嗓子让进程退」这个语义。`Notify` 也天然与上面那条
+    /// 互不影响：桌面端没人 await 它，通知发出去石沉大海，行为逐字不变。
+    self_exit_signal: Arc<tokio::sync::Notify>,
 }
 
 impl ServerState {
@@ -324,6 +370,36 @@ impl ServerState {
         //     这一步不能反：反了就是「先读配置、再开库」，配置只好去读旧文件
         //     —— 那正是本切片要消灭的形态，且迁移之后旧文件已被改名，
         //     第二次启动起配置就全空了。
+        // ── 整库恢复：**必须早于本函数里的任何库访问** ──────────────
+        // 位置就是这里，理由只有一条：Windows 无法替换一个被打开的文件。
+        // 下面 `Db::open` 一执行，库就被打开了，`rename` 必然失败。所以
+        // 「把备份换上去」只能钉在打开之前。
+        //
+        // 放在 `bootstrap` 里而不是各入口（桌面 `lib.rs` / headless `bin`）
+        // 各写一次：两个形态共用这一个开库点，钉在这里天然覆盖两者，
+        // 也不会有「新增第三个入口时忘了调」的隐患。桌面壳在调本函数之前
+        // 只碰过 `settings::load()`（那是壳自己的短命连接，在 Tauri setup 里，
+        // 早于这里且不共用本函数的 `Db`）—— 时序上仍然安全。
+        //
+        // **失败不阻断启动**：换库是「先拷副本、最后原子 rename」，任何一步
+        // 失败主库都原封不动（见 `db::restore` 模块头）。既然数据是安全的，
+        // 就没必要用「起不来」惩罚用户 —— 那会把一次选错文件变成程序打不开。
+        // 所以这里只记日志，照常往下走。
+        match db::restore::apply_pending() {
+            Ok(db::restore::RestoreOutcome::NothingToDo) => {}
+            Ok(db::restore::RestoreOutcome::Applied { safety }) => {
+                logging::console_line(
+                    "[Storage]",
+                    &format!("✅ 已从备份恢复数据库，替换前的旧库副本保留在 {}", safety.display()),
+                );
+            }
+            Err(error) => {
+                logging::console_line(
+                    "[Storage]",
+                    &format!("⚠️  整库恢复未完成（继续用当前数据库启动）：{error}"),
+                );
+            }
+        }
         // 打开失败**不阻断启动**（`db = None`），理由见 ServerState.db 的字段注释。
         let db_path = config_dir.join(db::FILE_NAME);
         let db = match db::Db::open(&db_path) {
@@ -530,6 +606,9 @@ impl ServerState {
             request_stats,
             db,
             upgrade_pending: Arc::new(AtomicBool::new(upgrade_pending)),
+            // 自退句柄要等 `start()` bind 成功才有值；`bootstrap` 阶段先留空槽。
+            self_exit: Arc::new(std::sync::Mutex::new(None)),
+            self_exit_signal: Arc::new(tokio::sync::Notify::new()),
         };
         logging::log("[Server]", "Agent2API 多提供商本地网关（Rust 进程内服务）启动中…");
         logging::log("[Config]", &format!("API 端口: {}", port));
@@ -791,6 +870,39 @@ impl ServerState {
     pub fn ui_dir(&self) -> Option<&PathBuf> {
         self.ui_dir.as_ref()
     }
+
+    /// 取走「进程自退」句柄（**只能成功一次**）。
+    ///
+    /// 唯一的调用方是整库恢复（`api::db_api::restore_database`）：备份已经落盘
+    /// 并通过校验，剩下的就是让本进程退出、由启动期的 `apply_pending()` 完成换库。
+    /// 为什么是「取走」而不是「克隆一份」：`oneshot::Sender` 不可克隆，而且
+    /// 自退本来就只该被触发一次 —— 第二个并发请求拿到 `None`，会如实告诉用户
+    /// 「需要手动重启」而不是重复触发一次无意义的退出。
+    ///
+    /// `None` 的两种来源：① `start()` 还没跑（bootstrap 与 start 之间的窗口，
+    /// 理论上没有 handler 能在此刻被调用）；② 已被别的请求取走。两种情况调用方
+    /// 的处理相同 —— 别假装成功。
+    pub fn take_self_exit(&self) -> Option<oneshot::Sender<()>> {
+        match self.self_exit.lock() {
+            Ok(mut slot) => slot.take(),
+            // 锁中毒 = 上一次持锁时 panic 过。这里没有需要保持一致的多字段状态，
+            // 但保守起见仍按「拿不到」处理：自退触发不了一次，用户可以手动重启。
+            Err(_) => None,
+        }
+    }
+
+    /// 自退的**进程级**信号（headless 的 `main` 等它，桌面端无人等）。
+    ///
+    /// 与 [`take_self_exit`](Self::take_self_exit) 的分工：那条 oneshot 负责
+    /// **优雅停机**（释放端口、跑完在途请求），这条 `Notify` 负责**让 `main`
+    /// 返回、进程真正退出**。恢复 handler 两条都发 —— 只发前者的话，headless
+    /// 会停在「HTTP 已停、进程还在」，容器不会拉起（详见字段文档）。
+    ///
+    /// 不取走、不判重：`notify_one` 可重复调用、最多留一个许可，
+    /// 「已经有人在退了」时多喊一嗓子无副作用。
+    pub fn self_exit_signal(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.self_exit_signal)
+    }
 }
 
 /// 读布尔型环境变量开关：**按候选名依次取第一个被设置的**（前一个是新名）。
@@ -879,13 +991,29 @@ pub fn start(state: &ServerState) -> Result<oneshot::Sender<()>, PortConflict> {
     };
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    // 自退通道（第二条同向 oneshot）：给 `ServerState::take_self_exit()` 用 ——
+    // 整库恢复的 handler 要在响应发完之后让本进程退出。为什么不直接把
+    // `shutdown_tx` 塞进 state：它不可克隆，且必须原样返回给调用方
+    // （桌面壳 `backend::shutdown` / headless 的 SIGTERM 收尾），签名不能动。
+    // 发送端存进 state 的空槽，接收端与 `shutdown_rx` 一起进下面的协调任务。
+    let (self_exit_tx, self_exit_rx) = oneshot::channel::<()>();
+    match state.self_exit.lock() {
+        Ok(mut slot) => *slot = Some(self_exit_tx),
+        // 锁中毒：自退能力缺失（恢复时会如实回「需要手动重启」），但服务照常起
+        Err(_) => logging::log("[Server]", "⚠️  自退句柄登记失败（整库恢复将需要手动重启）"),
+    }
     // 停机广播：oneshot 只有一个 receiver，而分端口形态有两个 serve 都要
     // 收到停机信号。协调任务把 oneshot 信号（send 或发送端被 drop）转成
     // watch 置位，两个 serve 各拿一份 receiver；watch 发送端 drop 也会让
     // `wait_for` 返回，停机语义与单 oneshot 一致。
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
     crate::spawn_task(async move {
-        let _ = shutdown_rx.await;
+        // 两条停机来源，谁先来算谁：调用方发来的信号（壳 / SIGTERM），
+        // 或整库恢复触发的自退。两者走**同一条**下游收尾路径（见上面 flush 的说明）。
+        tokio::select! {
+            _ = shutdown_rx => {}
+            _ = self_exit_rx => {}
+        }
         let _ = stop_tx.send(true);
     });
 

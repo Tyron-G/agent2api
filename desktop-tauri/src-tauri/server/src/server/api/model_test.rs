@@ -236,7 +236,17 @@ pub async fn run_model_test(State(state): State<ServerState>, body: Bytes) -> Re
     // `is_test = true` 一路带下去 —— 报表排除它、请求日志标记它
     state
         .request_stats()
-        .record_started(&test_id, started_at, &model, &model, &reasoning, true);
+        .record_started(
+            &test_id,
+            started_at,
+            &model,
+            &model,
+            &reasoning,
+            true,
+            // 管理端触发的连通性测试：不经过 Key 匹配，没有可归因的 Key
+            // （同 `KeyScope::provider_only` 的说明）
+            "",
+        );
     if let Some(token) = cancellation::register(&test_id) {
         telemetry.set_cancel_token(token);
     }
@@ -266,6 +276,8 @@ pub async fn run_model_test(State(state): State<ServerState>, body: Bytes) -> Re
         raw_request,
         raw_response: outcome.raw_response.clone(),
         is_test: true,
+        // 管理端测试无归因 Key（同上面 `record_started` 的说明）
+        key_id: String::new(),
     };
     pipeline::record_entry(&context, None);
     guard.complete();

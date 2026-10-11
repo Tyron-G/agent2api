@@ -5,7 +5,6 @@
 //!   providers/           提供商注册表（id/label）+ 聚合模型目录 + 模型路由
 //!                        （Agent2API 改造新增；见本文件末尾的模块分工）
 //!   account_store/       账号列表、凭证、优先级、迁移  （workbuddy-account-store.mjs）
-//!   account_transfer.rs  账号导入/导出                （workbuddy-account-transfer.mjs）
 //!   auth_http.rs         上游请求发送与解包、鉴权错误   （workbuddy-auth.mjs 的 api/unwrap）
 //!   auth.rs              会话、getStatus、鉴权头、刷新（workbuddy-auth.mjs 会话部分）
 //!   login.rs             无头登录与登录任务表          （auth.mjs 登录部分 + server.mjs 任务表）
@@ -51,7 +50,6 @@
 //! api/ 里的 handler 负责把 HTTP 输入转成 core 调用、再把结果转成响应。
 
 pub mod account_store;
-pub mod account_transfer;
 pub mod api_keys;
 pub mod auth;
 pub mod auth_http;

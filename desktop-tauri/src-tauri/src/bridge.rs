@@ -722,14 +722,14 @@ const BRIDGE_JS: &str = r#"
         label: window.__TAURI_INTERNALS__.metadata.currentWebview.label,
       }),
 
-    // ── 本壳特有：应用设置与账号导入导出 ──
+    // ── 本壳特有：应用设置与整库备份 / 恢复 ──
     // 这四项不走 api_request：设置存在桌面端本地（与后端无关），
-    // 导入导出需要调用系统文件对话框，只有壳进程能做。
+    // 备份 / 恢复需要调用系统文件对话框，只有壳进程能做。
     getAppSettings: () => invoke('get_app_settings'),
     // 参数名 patch 必须与 Rust 侧 save_app_settings 的形参名一致
     saveAppSettings: patch => invoke('save_app_settings', { patch }),
-    exportAccounts: () => invoke('export_accounts'),
-    importAccounts: () => invoke('import_accounts'),
+    backupDatabase: () => invoke('backup_database'),
+    restoreDatabase: () => invoke('restore_database'),
   };
 })();
 "#;

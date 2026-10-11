@@ -39,6 +39,7 @@
 - [快速開始](#快速開始)
 - [Docker 部署](#docker-部署)
 - [介面預覽](#介面預覽)
+- [資料庫備份 / 還原](#資料庫備份--還原)
 - [專案結構](#專案結構)
 - [開發與建置](#開發與建置)
 - [使用聲明](#使用聲明)
@@ -144,9 +145,9 @@ services:
 
 ### 報表
 
-概覽：請求數 / 成功率 / Token 總量 / Top 模型與帳號、供應商排名，附用量環圈圖與 365 天活躍熱力圖：
+概覽：請求數 / 成功率 / Token 總量 / Top 模型與帳號、供應商、閘道器 Key 排名，附用量環圈圖與 365 天活躍熱力圖：
 
-![報表概覽：統計卡片、Top 帳號 / 供應商、模型與供應商用量環圈圖](./assets/screenshots/report-overview.png)
+![報表概覽：統計卡片、Top 帳號 / 供應商 / 閘道器 Key、模型與供應商用量環圈圖](./assets/screenshots/report-overview.png)
 
 趨勢：24 小時**快取命中率**（折線）與 **Token 消耗**（面積）雙軸同圖，底部依天 Token 長條圖：
 
@@ -157,6 +158,20 @@ services:
 背景任務統一在這一頁（開關 / 間隔 / 上次結果 / 立即執行）；清單保存在 `~/.agent2api/config.json` 的 `scheduledTasks`，變更即時生效。
 
 ![排程任務頁：自動簽到、憑證維護、模型目錄重新整理等背景任務的開關與間隔](./assets/screenshots/scheduled-tasks.png)
+
+### 資料庫備份 / 還原
+
+在「設定 → 資料」裡可以匯出與還原**整庫備份**：匯出的是一份 `.db` 檔，內容就是整個 `agent2api.db` 的完整快照（帳號、日誌、統計、閘道 Key、面板設定全在裡面）。
+
+- **匯出**：桌面端彈系統儲存框、網頁端走瀏覽器下載。資料庫可達數百 MB（`request_raw` 一張表上限約 512MB），兩端都是串流收發，不會把整庫讀進記憶體。
+- **還原**：桌面端選檔、網頁端上傳。還原是**整體替換**，不是合併 —— 目前的資料庫會被備份檔整個覆蓋，因此：
+
+  - 還原前會自動把舊庫另存為 `agent2api.db.pre-restore`（同名覆蓋，只留一份），出問題可以拿它手動換回去；
+  - 還原後會**強制重啟**應用程式以完成換庫（換庫必須在任何資料庫存取之前發生）。桌面端自動重啟；Docker 部署靠 `restart: unless-stopped` 自動拉起，`docker run` 裸跑（沒有 `--restart`）則需手動 `docker compose up -d`。
+
+> ⚠️ **舊版的「帳號匯入 / 匯出」已移除**。它是按 uid 合併的 JSON 傳輸，依賴上游的帳號身分結構，而反向代理供應商的類型與欄位經常變動，那套身分歸一邏輯持續落後於上游、維護成本高。整庫備份/還原**不理解庫裡的任何業務語意**，上游怎麼變都不用改。
+>
+> 代價是**跨機合併帳號的能力沒有了**：整庫還原是替換語意，「把 A 機器的帳號併到 B 機器」以後做不到（合併恰恰需要理解帳號身分，而那正是要拋棄的東西）。cc-switch 同樣是替換語意。
 
 ---
 
@@ -273,13 +288,14 @@ agent2api/
 │  │  │  │  ├─ degrade.rs       內容攔截降級狀態機（撞上審核誤報後到次日 00:00 用中性提示詞）
 │  │  │  │  ├─ credential_maintenance.rs  已過期 / 臨期憑證的批次重新整理
 │  │  │  │  ├─ usage_query.rs     餘額 / 積分查詢（跨帳號並行 + 定時那一輪的快照）
-│  │  │  │  ├─ scheduled_tasks.rs  間隔型排程任務註冊表與調度迴圈（開關 / 間隔 /
+│  │  │  │  └─ scheduled_tasks.rs  間隔型排程任務註冊表與調度迴圈（開關 / 間隔 /
 │  │  │  │  │                      上次結果；設定在 config.json 的 scheduledTasks）
-│  │  │  │  └─ account_transfer.rs + account_transfer/ / auto_checkin.rs / update/
-│  │  │  │                       匯入匯出（含身分歸一）/ 定時簽到 / 軟體更新
+│  │  │  │  └─ auto_checkin.rs / update/   定時簽到 / 軟體更新
+│  │  │  ├─ db/                本機儲存的唯一真相：單一 SQLite 檔（連線與句柄 / 建表與
+│  │  │  │                     版本升級 / 舊檔案一次性遷移 / 整庫備份與還原）
 │  │  │  └─ api/                 各路由 handler（health/session/accounts/accounts_usage/
 │  │  │                          chat/models/keys/model_manage/stats/logs/billing/
-│  │  │                          sanitize/prompt/auto-checkin/scheduled-tasks/update/…）
+│  │  │                          sanitize/prompt/auto-checkin/scheduled-tasks/update/db/…）
 │  │  ├─ lib.rs                 應用程式入口（設定目錄遷移 → 設定 → 系統匣 → 主視窗 → 啟動後端）
 │  │  ├─ backend.rs              行程內伺服器生命週期
 │  │  ├─ legacy_install.rs       舊「目前使用者」安裝的清理（目錄 / 捷徑 / 解除安裝項目 / 開機自啟；僅 release）
@@ -336,7 +352,7 @@ npm run build:icon         # 產生圖示來源圖（改圖示設計後執行，
 
 ### 憑證與資料風險
 
-本專案會把帳號憑證（`accessToken` / `refreshToken` 等）以**明文**形式保存在本機設定目錄（預設 `~/.agent2api/`）中，匯出功能產生的檔案同樣包含明文憑證。請自行妥善保管，切勿提交到公開倉庫、上傳到雲端硬碟或分享給他人。因憑證洩露造成的損失由使用者自行承擔。
+本專案會把帳號憑證（`accessToken` / `refreshToken` 等）以**明文**形式保存在本機設定目錄（預設 `~/.agent2api/`）的 SQLite 資料庫 `agent2api.db` 中，而整庫備份匯出的 `.db` 檔是**整個資料庫的完整副本** —— 除了帳號憑證，還包含閘道 Key、自訂供應商定義、面板管理員密碼雜湊與登入人機驗證（ALTCHA）金鑰。換句話說，拿到這份備份就等於拿到了這個實例的**全部身分與設定**：請自行妥善保管，切勿提交到公開倉庫、上傳到雲端硬碟或分享給他人。因憑證洩露造成的損失由使用者自行承擔。
 
 ### 無擔保與權利通知
 

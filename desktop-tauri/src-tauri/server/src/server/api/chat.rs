@@ -77,13 +77,21 @@ pub async fn chat_completions(
     body: Bytes,
 ) -> Response {
     let scope = key_scope.map(|Extension(scope)| scope);
+    // 归因 Key：本次调用命中的网关 Key id（空串 = 未归因）。取一次存下来 ——
+    // `scope` 随后会被 move 进 `ForwardRequest.allowed_providers`（见下方），
+    // 而三条早失败路径、进行中行的插入、以及收尾上下文都要用它。
+    // 记账是「谁调用的」，与转发无关，所以即使 `scope` 被消费掉也不影响。
+    // 取成 `String` 而非 `&str` 正是为此：借来的话 `scope` 就 move 不出去了。
+    let key_id = scope
+        .as_ref()
+        .map_or_else(String::new, |scope| scope.key_id().to_string());
     // 请求开始时刻（请求统计用）。放在最前面：它要覆盖 body 解析与选路的耗时
     let started_at = logging::now_ms();
     // ① body 必须是 JSON 对象（数组/标量/null 都算非法）
     let parsed = serde_json::from_slice::<Value>(&body).ok();
     let Some(mut payload) = parsed.filter(Value::is_object) else {
         let error = GatewayError::bad_request("请求体必须是 JSON 对象");
-        record_early_failure(&state, started_at, "", "", &error);
+        record_early_failure(&state, started_at, "", "", &error, &key_id);
         return error.payload_response();
     };
     // ② messages 必须是数组
@@ -95,7 +103,7 @@ pub async fn chat_completions(
         let error = GatewayError::bad_request("缺少 messages 数组");
         let model = model_field_text(&payload);
         let reasoning = pipeline::client_reasoning_of(&payload);
-        record_early_failure(&state, started_at, &model, &reasoning, &error);
+        record_early_failure(&state, started_at, &model, &reasoning, &error, &key_id);
         return error.payload_response();
     }
 
@@ -129,6 +137,7 @@ pub async fn chat_completions(
                 &model_field_text(&payload),
                 &client_reasoning,
                 &error,
+                &key_id,
             );
             return error.payload_response();
         }
@@ -163,6 +172,8 @@ pub async fn chat_completions(
             &client_reasoning,
             // 真实流量：不是模型测试（见 `RecordContext::is_test`）
             false,
+            // 归因 Key：与终态行同源，收尾的 UPDATE 会再写一次同一个值
+            &key_id,
         );
     // ── 手动终止的取消令牌（本次新增）────────────────────────────
     // 登记在进程级注册表里（键 = 上面这个 id），详情页的「终止请求」按它
@@ -226,6 +237,7 @@ pub async fn chat_completions(
                 raw_response: None,
                 // 转发主链路：不是模型测试（见 `RecordContext::is_test`）
                 is_test: false,
+                key_id: key_id.to_string(),
             };
             // 收尾帧特征取 Chat 的：客户端读到 `data: [DONE]` 就停是常态写法，
             // 那时连接会被立刻关掉、`Drop` 不会被拉到 EOF（见 `RecordingStream`）
@@ -259,6 +271,7 @@ pub async fn chat_completions(
                     raw_response,
                     // 转发主链路：不是模型测试
                     is_test: false,
+                    key_id: key_id.to_string(),
                 },
                 None,
             );
@@ -290,6 +303,7 @@ pub async fn chat_completions(
                     raw_response: None,
                     // 转发主链路：不是模型测试
                     is_test: false,
+                    key_id: key_id.to_string(),
                 },
                 Some(message),
             );

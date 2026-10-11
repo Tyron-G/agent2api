@@ -17,7 +17,9 @@ use chrono::{Datelike, Duration as ChronoDuration, NaiveDate};
 use serde_json::{json, Value};
 
 use super::clock::{date_key, hour_floor, hour_key, ms_to_local, now_ms};
-use super::record::{AccountAccum, DailyEntry, ModelAccum, ProviderAccum, RequestEntry};
+use super::record::{
+    AccountAccum, DailyEntry, KeyAccum, ModelAccum, ProviderAccum, RequestEntry,
+};
 
 /// 未知 provider 的展示名（`id` 为空串的那一组：旧版本写出的明细、
 /// 以及「一次都没发出去就失败」的请求）。前端也会用同样的文案做降级显示。
@@ -29,6 +31,13 @@ pub(super) const UNKNOWN_PROVIDER_LABEL: &str = "未知";
 /// 成因不同（前者是没记下承载的家，后者是没走账号列表），文案将来若分叉，
 /// 共用会让改一处等于改两处。
 pub(super) const UNKNOWN_ACCOUNT_LABEL: &str = "未知账号";
+
+/// 未知网关 Key 的展示名（没有 Key 身份的那一组：免鉴权模式、环境变量 Key、
+/// 以及 v10 之前写出的行）。
+///
+/// 与上面两条同样是**独立常量**：这里的「未知」成因是「这次调用没经过 Key 匹配」，
+/// 文案将来若与账号那条分叉，共用会让改一处等于改两处。
+pub(super) const UNKNOWN_KEY_LABEL: &str = "未知 Key";
 
 /// 热力图固定返回的天数（与 range 解耦）
 pub(super) const HEATMAP_DAYS: i64 = 365;
@@ -84,7 +93,7 @@ pub(super) fn range_bounds(
     (date_key(start), date_key(end))
 }
 
-/// 区间内的总量与按模型 / 按 provider / 按账号累计（overview 的原料）
+/// 区间内的总量与按模型 / 按 provider / 按账号 / 按 Key 累计（overview 的原料）
 pub(super) struct RangeTotals {
     pub requests: i64,
     pub successful: i64,
@@ -93,6 +102,7 @@ pub(super) struct RangeTotals {
     pub model_totals: Vec<ModelAccum>,
     pub provider_totals: Vec<ProviderAccum>,
     pub account_totals: Vec<AccountAccum>,
+    pub key_totals: Vec<KeyAccum>,
 }
 
 /// 按区间累计聚合行。`BTreeMap::range` 直接按日期键取闭区间 ——
@@ -110,6 +120,7 @@ pub(super) fn range_totals(
         model_totals: Vec::new(),
         provider_totals: Vec::new(),
         account_totals: Vec::new(),
+        key_totals: Vec::new(),
     };
     // 闭区间 [start, end]：定长日期串的字典序即时间序，所以直接按键取范围。
     // 这里构造两个 String 边界是有意的取舍 —— 报表调用频率是「用户点一下」级别，
@@ -139,6 +150,15 @@ pub(super) fn range_totals(
                 &mut totals.account_totals,
                 &acc.account_id,
                 &acc.account_name,
+                acc.requests,
+                acc.successful,
+                acc.tokens,
+            );
+        }
+        for acc in &day.key_stats {
+            push_key_accum(
+                &mut totals.key_totals,
+                &acc.key_id,
                 acc.requests,
                 acc.successful,
                 acc.tokens,
@@ -179,6 +199,25 @@ pub(super) fn range_totals(
     push_account_accum(
         &mut totals.account_totals,
         "",
+        "",
+        (totals.requests - covered_requests).max(0),
+        (totals.successful - covered_successful).max(0),
+        (totals.tokens - covered_tokens).max(0),
+    );
+
+    // ── Key 维度同理 ────────────────────────────────────────────
+    // `keyStats` 是本版新增的键，**所有**已有聚合行都没有它，所以这一段
+    // 与账号那一段同理：升级后第一次打开报表，区间内几乎全部请求都会落进
+    // 「未知 Key」组。这是如实反映「那些行没记 Key 身份」，而不是丢数据。
+    //
+    // 与 provider / account 两段的**唯一差异**：这里没有回填（见 `V10_SCHEMA`
+    // 的说明）—— 旧明细行的 `key_id` 是空串，本就归不进任何一把真实的 Key，
+    // 重算只会把它们算进同一个空 id 组，与不重算的结果逐字段相同。
+    let covered_requests: i64 = totals.key_totals.iter().map(|item| item.requests).sum();
+    let covered_successful: i64 = totals.key_totals.iter().map(|item| item.successful).sum();
+    let covered_tokens: i64 = totals.key_totals.iter().map(|item| item.tokens).sum();
+    push_key_accum(
+        &mut totals.key_totals,
         "",
         (totals.requests - covered_requests).max(0),
         (totals.successful - covered_successful).max(0),
@@ -273,8 +312,35 @@ pub(super) fn push_account_accum(
     }
 }
 
-/// provider id → 展示 label（中文名）。
+/// 把一批（一条或一天的）请求并进按网关 Key 的累计表。
 ///
+/// 与 `push_account_accum` 同形，但**没有名字那一维**（理由见 `record::KeyAccum`：
+/// Key 名是运行期配置，快照会过期且无人刷新，所以留给 API 层现算）。
+/// 匹配只认 `key_id`；空串照常建组，不丢弃 —— 免鉴权 / 环境变量 Key /
+/// 旧数据都落在这一组里，丢掉它们会让「各 Key 之和」对不上区间总量。
+pub(super) fn push_key_accum(
+    list: &mut Vec<KeyAccum>,
+    key_id: &str,
+    requests: i64,
+    successful: i64,
+    tokens: i64,
+) {
+    match list.iter_mut().find(|item| item.key_id == key_id) {
+        Some(item) => {
+            item.requests += requests;
+            item.successful += successful;
+            item.tokens += tokens;
+        }
+        None => list.push(KeyAccum {
+            key_id: key_id.to_string(),
+            requests,
+            successful,
+            tokens,
+        }),
+    }
+}
+
+/// provider id → 展示 label（中文名）。
 /// 走 `providers::meta` 的注册表换算，**不在这里维护第二份 id→label 映射**：
 /// 注册表是 provider 身份的唯一事实来源，两处映射迟早漂移，而这类漂移不会报错，
 /// 只会让报表里的名字与账号页对不上。
@@ -424,6 +490,50 @@ pub(super) fn build_accounts(totals: &[AccountAccum]) -> Vec<Value> {
             };
             json!({
                 "id": item.account_id,
+                "label": label,
+                "requests": item.requests,
+                "success": item.successful,
+                "failures": (item.requests - item.successful).max(0),
+                "totalTokens": item.tokens,
+            })
+        })
+        .collect()
+}
+
+/// 区间级的按网关 Key 汇总 → `/api/stats/summary` 的 `keys` 数组。
+///
+/// ── 为什么 label 是 id 而不是名字 ───────────────────────────
+/// 与 `build_accounts` 的关键差异：账号名是聚合行里的**数据快照**，
+/// 而 Key 名是**运行期配置**（`api_keys::list()` 随时可读）。这里保持纯函数，
+/// 只把 id 当 label 兜底；真正的展示名由 API 层用当前配置覆盖
+/// （见 `api::stats_api`）。好处是这一层可被单测直接喂数据，
+/// 不依赖任何运行期状态。
+///
+/// 空 id 那一组用「未知 Key」而不是空串：这份数组是**给图表用的**，
+/// 每段都要有可显示的图例名（同 `build_providers` 的理由）。
+/// 排序与另两份一致（requests ↓、tokens ↓、id ↑），末级只为结果稳定。
+pub(super) fn build_keys(totals: &[KeyAccum]) -> Vec<Value> {
+    // 与 build_providers / build_accounts 同一取舍：全零的组不返回
+    let mut rows: Vec<&KeyAccum> = totals
+        .iter()
+        .filter(|item| item.requests > 0 || item.tokens > 0)
+        .collect();
+    rows.sort_by(|left, right| {
+        right
+            .requests
+            .cmp(&left.requests)
+            .then(right.tokens.cmp(&left.tokens))
+            .then(left.key_id.cmp(&right.key_id))
+    });
+    rows.into_iter()
+        .map(|item| {
+            let label = if item.key_id.is_empty() {
+                UNKNOWN_KEY_LABEL.to_string()
+            } else {
+                item.key_id.clone()
+            };
+            json!({
+                "id": item.key_id,
                 "label": label,
                 "requests": item.requests,
                 "success": item.successful,

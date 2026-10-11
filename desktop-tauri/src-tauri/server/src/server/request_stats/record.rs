@@ -289,6 +289,22 @@ pub struct RequestEntry {
     /// `row.get(n)` 的序号。
     #[serde(rename = "isTest", default)]
     pub is_test: bool,
+    /// **这次调用命中的网关 Key 的 id**（schema v10 加的列；旧行 `default` 读成
+    /// 空串 = 未归因）。
+    ///
+    /// 存 id 而不是 Key 名或 Key 明文：id 是稳定的，名可以随时改（改了旧记录就
+    /// 对不上了），而明文根本不该落进统计表。展示层用 `api_keys::list()` 把 id
+    /// 翻成当前名字 —— 名字是运行期配置，只有那一刻才是权威的。
+    ///
+    /// 空串的三种情形（都是**正常**的，不是缺失）：免鉴权模式（一把启用的 Key
+    /// 都没有）、环境变量 Key（`WORKBUDDY_PROXY_API_KEY`，没有列表记录可挂 id）、
+    /// 管理端发起的模型测试（不经 Key 匹配）。这三种在「按 Key」这一维上都归到
+    /// 未知组 —— 与 `account_id` 空串归「未知账号」同一取向。
+    ///
+    /// 与 `phase` / `is_test` 同一位置纪律：新加的列排在结构体末尾，不牵动
+    /// 前面所有 `row.get(n)` 的序号。
+    #[serde(rename = "keyId", default)]
+    pub key_id: String,
 }
 
 /// 一个被命中的敏感词及其次数（存储契约）。
@@ -452,6 +468,11 @@ pub struct NewRequestEntry {
     pub sensitive_hits: Vec<SensitiveHit>,
     /// 这条请求是不是模型测试发起的（见 `RequestEntry::is_test`；默认 false）。
     pub is_test: bool,
+    /// 命中的网关 Key id（见 `RequestEntry::key_id`；空串 = 未归因）。
+    ///
+    /// 与其余字段不同，它在**请求开始时**就已定稿（Key 匹配发生在中间件里，
+    /// 早于转发），所以两条 INSERT 都能拿到它 —— 见 `insert_started_request`。
+    pub key_id: String,
 }
 
 impl NewRequestEntry {
@@ -486,6 +507,9 @@ impl NewRequestEntry {
             // 默认是真实流量；模型测试那一条由 `api::model_test` 显式改成 true
             // （`RecordContext::is_test` 一路带过来）
             is_test: false,
+            // 空串 = 未归因。记账点从 `RecordContext::key_id` 覆盖它
+            // （免鉴权模式 / 环境变量 Key / 模型测试三种情形就保持空串）
+            key_id: String::new(),
         }
     }
 
@@ -596,6 +620,8 @@ impl NewRequestEntry {
             // 来源标记原样透传（不做任何推导）：它是调用方（入口 handler）
             // 才知道的事实，存储层只负责把它带进库里
             is_test: self.is_test,
+            // 归因 Key 同样原样透传，trim 的理由与 provider 相同
+            key_id: self.key_id.trim().to_string(),
         }
     }
 }
@@ -707,6 +733,14 @@ pub struct DailyEntry {
     /// 保留期，只有明细的话 `all` / `month` 会在明细到期后突然少掉一大段。
     #[serde(rename = "accountStats", default, skip_serializing_if = "Vec::is_empty")]
     pub account_stats: Vec<AccountAccum>,
+    /// 当天的按「网关 Key」累计（**契约之外的补充字段**）。
+    ///
+    /// 与 `accountStats` 同一理由：区间级的 Key 用量排行要跨过明细的 30 天
+    /// 保留期，只有明细的话 `all` / `month` 会在明细到期后突然少掉一大段。
+    ///
+    /// 与 `accountStats` 的**唯一差异**：这里不存名字快照（见 `KeyAccum`）。
+    #[serde(rename = "keyStats", default, skip_serializing_if = "Vec::is_empty")]
+    pub key_stats: Vec<KeyAccum>,
 }
 
 impl DailyEntry {
@@ -722,6 +756,7 @@ impl DailyEntry {
             model_tokens: Vec::new(),
             provider_stats: Vec::new(),
             account_stats: Vec::new(),
+            key_stats: Vec::new(),
         }
     }
 }
@@ -784,6 +819,37 @@ pub struct AccountAccum {
     pub tokens: i64,
 }
 
+/// 单把网关 Key 在某天的累计（聚合行的组成部分）。
+///
+/// 与 `AccountAccum` 同形（requests / successful / tokens + 身份），
+/// 因为两份累计回答的是同一个问题的两个视角：「哪个账号承载的」与「哪把 Key 调用的」。
+/// 失败数同样由减法得出，不另存一列（理由见 `ProviderAccum`）。
+///
+/// ── 为什么**只存 id 不存名字**（与 `AccountAccum` 的关键差异）────
+/// 账号名是**账号记录自身的数据**，删号后无处可查，所以必须留一份快照。
+/// Key 名不是：它是运行期配置（`api_keys::list()` 随时可读，见 `ApiKeyEntry`），
+/// 不在被保留期裁剪的对象里。存进聚合行反而有害 —— 名字在配置里一改，
+/// 聚合行里那份就是过期快照，而且**没有任何机制会去刷新历史行**，
+/// 报表从此显示旧名直到那些天被重算。所以名字在 **API 层**用当前配置装饰，
+/// `report.rs` 保持纯函数（不依赖运行期配置，也就能被单测直接喂数据）。
+///
+/// ── 空 id 的含义 ────────────────────────────────────────────
+/// 空串表示「不知道是哪把 Key 调用的」，有两种来源：
+///   ① 免鉴权模式（一把启用的 Key 都没有）、或环境变量 Key —— 两者都取不到 id；
+///   ② v10 之前写出的行（`key_id` 列不存在，升级后读到空串）。
+/// 与 provider / account 的空串同一口径，由展示层给占位文案。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct KeyAccum {
+    #[serde(rename = "keyId", default)]
+    pub key_id: String,
+    #[serde(default)]
+    pub requests: i64,
+    #[serde(default)]
+    pub successful: i64,
+    #[serde(default)]
+    pub tokens: i64,
+}
+
 /// 明细查询条件（「模型请求日志」页用）——
 /// 路由 `/api/stats/requests` 的查询串解析结果（见 `api::stats_api`）
 #[derive(Clone, Debug, Default)]
@@ -799,6 +865,12 @@ pub struct RequestQuery {
     /// 空 id 的行（一次都没发出去就失败的请求）**筛不到** —— 那不是某一家的问题，
     /// 用 `status=error` 看它们更直接。界面的下拉也只列出现过的非空 id。
     pub provider: Option<String>,
+    /// 精确匹配网关 Key id（`key_id` 列）；None 不过滤。
+    ///
+    /// 与 `provider` 同一取舍：空 id 的行（免鉴权 / 环境变量 Key / v10 之前
+    /// 写出的行）**筛不到** —— 那不是某一把 Key 的问题。界面的下拉也只列出
+    /// 出现过的非空 id（见 `filter_options`）。
+    pub key_id: Option<String>,
     /// `"ok"` = 2xx / `"error"` = 非 2xx / None 不过滤
     pub status: Option<String>,
     /// 起始毫秒时间戳（闭区间下界）

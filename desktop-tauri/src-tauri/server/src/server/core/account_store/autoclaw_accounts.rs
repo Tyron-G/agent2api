@@ -46,7 +46,7 @@
 //! `enc:v10:...`）。本函数用凭证层的 `credentials_from_record` 解析 —— 它会
 //! 自动走 DPAPI + AES-GCM 解密链（T-c1 已验证），**落盘存解密后的明文**：
 //! 与原项目 `addAccount` 一致（它也是解密后再存），且让账号能随
-//! `/api/accounts/export` 迁移到另一台机器。凭证层仍然认 `enc:` 形态（手改
+//! 整库备份迁移到另一台机器。凭证层仍然认 `enc:` 形态（手改
 //! 文件塞密文的用户不受影响）。
 //!
 //! ── 硬约束 ────────────────────────────────────────────────
@@ -85,10 +85,9 @@ pub const DESKTOP_ACCOUNT_ID: &str = "autoclaw-desktop";
 
 /// 国际版桌面端账号的固定 id（[`DESKTOP_ACCOUNT_ID`] 的国际版对应值）。
 ///
-/// `pub` 而不是私有：账号迁移的「保留 id」清单要列出它
-/// （`account_transfer::identity::RESERVED_DESKTOP_IDS`）——
-/// 漏了它，这条桌面端记录就能被当成普通账号导入，然后因为「不落 token」
-/// 而永远 `available: false`。
+/// `pub` 而不是私有：账号侧的「保留 id」清单要列出它 ——
+/// 漏了它，这条桌面端记录就会被当成普通账号参与身份去重，
+/// 然后因为「不落 token」而永远 `available: false`。
 pub const INTL_DESKTOP_ACCOUNT_ID: &str = "autoclaw-intl-desktop";
 
 /// 按地区取桌面端账号的固定 id。

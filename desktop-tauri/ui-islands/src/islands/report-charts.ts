@@ -38,6 +38,8 @@ export type StatsSummary = {
   providers?: StatsGroup[]
   accounts?: StatsGroup[]
   models?: StatsGroup[]
+  /** 按网关 Key 的区间汇总（与 providers / accounts 同形；缺失 = 后端版本旧，整块隐藏） */
+  keys?: StatsGroup[]
   heatmap?: StatsDay[]
   cacheRates?: Record<string, CacheRateWindow>
   cacheTrend24h?: StatsHour[]
