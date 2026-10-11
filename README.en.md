@@ -147,7 +147,7 @@ Pick a provider, then sign in; one vendor can hold several account versions (e.g
 
 Overview: requests / success rate / tokens / top model, with account, provider and gateway key rankings, usage donuts and a 365-day activity heatmap:
 
-![Report overview: stat cards, top accounts / providers / gateway keys, model and provider usage donuts](./assets/screenshots/report-overview.png)
+![Report overview: stat cards, top accounts / providers, model and provider usage donuts](./assets/screenshots/report-overview.png)
 
 Trends: 24-hour **cache hit rate** (line) and **token consumption** (area) on twin axes, with a per-day token bar chart below:
 

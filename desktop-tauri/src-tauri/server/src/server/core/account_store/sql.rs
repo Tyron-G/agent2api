@@ -286,8 +286,7 @@ fn enabled_flag(record: &StoredAccount) -> i64 {
 /// 把一整份 `AccountState` **按差异**写入（同一个事务内）。
 ///
 /// 用于「本来就是整份集合的操作」：`batch_update` / `batch_remove`、
-/// `migrate_startup`、三家旧数据导入（它们经 `save_locked` 走到这里）。
-/// 这些路径的算法本身要遍历全部账号
+/// `migrate_startup`。这些路径的算法本身要遍历全部账号
 /// （去重编号、批量匹配、快照回显），读全量是**语义要求**而不是偷懒；
 /// 但**写**不该因此重写整表 —— 因此这里先取现有行的 JSON，与目标状态逐条比对：
 ///   - 目标里有、库里没有 → INSERT

@@ -147,7 +147,7 @@ Escolha o provedor e entre; o mesmo fornecedor pode manter várias versões de c
 
 Visão geral: requisições / taxa de sucesso / tokens / modelo mais usado, com rankings por conta, provedor e chave do gateway, roscas de uso e mapa de calor de 365 dias:
 
-![Visão geral do relatório: cartões de estatística, top contas / provedores / chaves do gateway, roscas de uso por modelo e por provedor](./assets/screenshots/report-overview.png)
+![Visão geral do relatório: cartões de estatística, top contas / provedores, roscas de uso por modelo e por provedor](./assets/screenshots/report-overview.png)
 
 Tendências: **taxa de acerto de cache** (linha) e **consumo de tokens** (área) em dois eixos, com barras de tokens por dia abaixo:
 

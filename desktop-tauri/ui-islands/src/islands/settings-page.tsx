@@ -150,7 +150,7 @@ import { t } from '../i18n'
  * `.head-actions` / `.settings-switches` / `.settings-state` / `.retention-list` /
  * `.retention-row` / `.retention-input` / `.unit` / `.hint` / `.retention-note` /
  * `.prompt-input` / `.tag-input` / `.tag-chip` / `.tag-x` / `.storage-line` /
- * `.storage-path` / `.storage-counts` / `.storage-count` / `.danger-zone` / `.io-result`），
+ * `.storage-path` / `.storage-counts` / `.storage-count` / `.danger-zone`），
  * 它们是这一页的排版而不是「组件」（样式在 ui/css/page-settings.css）。
  * 控件换组件库：原生 input → Input、原生 checkbox → Switch、原生 select → Select 一族、
  * button → Button、`.badge` → Badge、`#retention-modal` → Dialog。

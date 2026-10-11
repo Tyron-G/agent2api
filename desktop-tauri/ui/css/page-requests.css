@@ -397,7 +397,7 @@
     grid-template-columns: 92px minmax(0, 1fr) 96px 52px;
     row-gap: 4px;
   }
-  /* 重排成四行之后轨道已经不是那九条了：上面这条声明直接覆盖 --req-cols，
+  /* 重排成四行之后轨道已经不是那十条了：上面这条声明直接覆盖 --req-cols，
      拖动没有意义，把手一并收起，免得点了没反应 */
   .req-head .col-grip { display: none; }
 

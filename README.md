@@ -147,7 +147,7 @@ services:
 
 概览：请求数 / 成功率 / Token 总量 / Top 模型、账号、提供商与网关 Key 排名，附用量环图与 365 天活跃热力图：
 
-![报表概览：统计卡片、Top 账号 / 提供商 / 网关 Key、模型与提供商用量环形图](./assets/screenshots/report-overview.png)
+![报表概览：统计卡片、Top 账号 / 提供商、模型与提供商用量环形图](./assets/screenshots/report-overview.png)
 
 趋势：24 小时**缓存命中率**（折线）与 **Token 消耗**（面积）双轴同图，底部按天 Token 柱状图：
 

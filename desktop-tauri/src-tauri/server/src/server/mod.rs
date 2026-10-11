@@ -48,7 +48,7 @@
 //!     logs_api.rs   GET /api/logs、/stats、/download、DELETE
 //!     stats_api.rs  GET /api/stats/summary、/api/stats/requests、DELETE /api/stats/requests、
 //!                   GET/PUT /api/retention（统计报表 + 数据保留策略）
-//!     accounts.rs   /api/accounts*（增删改查/切换/排序/批量/导入导出/刷新）
+//!     accounts.rs   /api/accounts*（增删改查/切换/排序/批量/刷新）
 //!     proxies.rs    /api/proxies*（Clash 实时读取 + 出口连通性测试）
 //!     billing.rs    /api/usage、/api/checkin*、/api/activity/*（对照 server.mjs 871-911）
 //!     chat.rs       POST /v1/chat/completions、GET /v1/models（对话主链路）

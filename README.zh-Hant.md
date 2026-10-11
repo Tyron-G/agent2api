@@ -145,9 +145,9 @@ services:
 
 ### 報表
 
-概覽：請求數 / 成功率 / Token 總量 / Top 模型與帳號、供應商、閘道器 Key 排名，附用量環圈圖與 365 天活躍熱力圖：
+概覽：請求數 / 成功率 / Token 總量 / Top 模型、帳號、供應商與閘道 Key 排名，附用量環圈圖與 365 天活躍熱力圖：
 
-![報表概覽：統計卡片、Top 帳號 / 供應商 / 閘道器 Key、模型與供應商用量環圈圖](./assets/screenshots/report-overview.png)
+![報表概覽：統計卡片、Top 帳號 / 供應商、模型與供應商用量環圈圖](./assets/screenshots/report-overview.png)
 
 趨勢：24 小時**快取命中率**（折線）與 **Token 消耗**（面積）雙軸同圖，底部依天 Token 長條圖：
 

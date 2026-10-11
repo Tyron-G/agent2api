@@ -1278,7 +1278,12 @@ function RequestsPage() {
   else if (filters.status === 'ok') summaryParts.push(t('只看成功'))
   else if (filters.status === 'error') summaryParts.push(t('只看失败'))
   if (filters.provider) summaryParts.push(providerLabelOf(filters.provider))
-  if (filters.key) summaryParts.push(filters.key)
+  // Key 这一维要摊出**名字**而不是 id：下拉里显示的是 `label`（Key 名可改），
+  // 页脚却印一个 `k19a3f2c4b0` 就与用户刚选的那一项对不上 —— 与上面 provider
+  // 走 `providerLabelOf` 同一口径。找不到（Key 已被删）时退回 id，别让条件消失。
+  if (filters.key) {
+    summaryParts.push(keyOptions.find(item => item.value === filters.key)?.label || filters.key)
+  }
   if (filters.model) summaryParts.push(filters.model)
 
   /** 选中值不在候选清单里（筛着某个模型时把日志清空了 / 排在第 201 位）就把它自己补进去 ——

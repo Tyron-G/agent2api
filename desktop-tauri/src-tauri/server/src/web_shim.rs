@@ -31,7 +31,7 @@
 //!     HTTP 回调；Trae / Accio / CodeArts：网页端自动提供“粘贴回调地址”兜底。
 //!
 //! ── 壳特有命令的降级 ────────────────────────────────────────
-//! 窗口主题、托盘、改端口、软件更新安装、桌面设置、文件对话框导入导出
+//! 窗口主题、托盘、改端口、软件更新安装、桌面设置、文件对话框备份恢复
 //! 这些只有壳能做的事按「能映射则映射，不能则明确拒绝」处理：
 //! 拒绝给出可读文案（界面会 toast 出来），绝不静默假成功。
 
@@ -495,21 +495,9 @@ pub fn shim_js() -> &'static str {
     var response = await fetch(path, { method: method, headers: headers });
     if (!response.ok) throw new Error('导出失败（HTTP ' + response.status + '）');
     var blob = await response.blob();
-    // 管理 API 的响应带 { success, data } 信封：落盘前剥掉，存 data 本体。
-    // 现在留下的两个下载端点（整库备份 / 日志）都是**裸文件**，`JSON.parse`
-    // 必然抛错、走下面的 catch 按原文存 —— 正是要的行为，所以这段保留不动
-    // （它同时是「日志下载」的正确路径）。
+    // 现存的两个下载端点（整库备份 / 日志）回的都是**裸文件**，不是
+    // `{ success, data }` 信封，所以这里按原文存、不剥信封。
     var summary = {};
-    try {
-      var body = JSON.parse(await blob.text());
-      if (body && body.success === true && body.data && typeof body.data === 'object') {
-        var accounts = Array.isArray(body.data.accounts) ? body.data.accounts : null;
-        var providers = Array.isArray(body.data.customProviders) ? body.data.customProviders : null;
-        if (accounts) summary.count = accounts.length;
-        if (providers) summary.customProviders = providers.length;
-        blob = new Blob([JSON.stringify(body.data, null, 2)], { type: 'application/json' });
-      }
-    } catch (e) { /* 非 JSON 响应（整库备份 / 日志下载）按原文保存 */ }
     var url = URL.createObjectURL(blob);
     var link = document.createElement('a');
     link.href = url;
@@ -1076,7 +1064,7 @@ pub fn shim_js() -> &'static str {
     windowIsMaximized: function () { return Promise.resolve(false); },
     onWindowResize: function () { return function () {}; },
 
-    // ── 应用设置与账号导入导出 ──
+    // ── 应用设置与数据库备份 / 恢复 ──
     getAppSettings: function () { return invokeShell('get_app_settings'); },
     saveAppSettings: function (patch) {
       // 无处持久化也不该报错：界面保存成功即可（本次会话内忽略）
