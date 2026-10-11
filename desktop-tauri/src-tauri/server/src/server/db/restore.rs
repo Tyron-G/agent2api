@@ -33,6 +33,12 @@
 //! 「旧数据还在 + 一句说清为什么没恢复」。校验不过的 pending 直接删掉
 //! （用户手上那份原始备份文件始终没被动过），替换失败的 pending 留着下次重试。
 //!
+//! ⚠️ 上面那句「任何一步失败主库都原封不动」**不是白来的**，它有一个前提：
+//! **第 2 步必须先把 `-wal` 并干净**。因为第 4 步会无条件删 `-wal`、而第 3 步的
+//! 副本不含它，若带着没并干净的 `-wal` 往下走，一旦第 5 步 rename 失败，主库
+//! 就会丢掉已提交的尾巴。所以第 2 步**并不动就整个放弃**（见 [`drain_wal`]）——
+//! 那是维持这条承诺的必要条件，不是可以省掉的优化。
+//!
 //! ```text
 //! db/
 //!   mod.rs     连接与句柄（Db::open / with / with_mut / file）
@@ -186,14 +192,12 @@ pub(crate) fn apply_at(dir: &Path) -> Result<RestoreOutcome, String> {
         return Err(format!("备份文件不可用，已忽略（{reason}）"));
     }
 
-    // ── 第 2 步：把旧库的 WAL 并回去 ──────────────────────────
-    // 用**短命连接**：它只活这一次 checkpoint，用完即关（关掉才轮到我们动
-    // 文件）。best-effort —— 失败不阻断，最坏情况是第 3 步的副本少了几条
-    // 还没合并的记录，比「恢复整个做不成」轻。
+    // ── 第 2 步：把旧库的 WAL 并回去（**并不动就整个放弃**）────────
+    // 用**短命连接**：它只活这一次 checkpoint，用完即关（关掉才轮到我们动文件）。
+    // 这一步失败必须**阻断**整个恢复，不能 best-effort —— 理由见 `drain_wal`：
+    // 并不动就意味着第 4 步要删的 `-wal` 里还压着用户已提交的数据。
     if main.exists() {
-        if let Ok(conn) = Connection::open(&main) {
-            let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
-        }
+        drain_wal(&main)?;
     }
 
     // ── 第 3 步：留旧库副本 ───────────────────────────────────
@@ -228,6 +232,89 @@ pub(crate) fn apply_at(dir: &Path) -> Result<RestoreOutcome, String> {
         .map_err(|error| format!("替换数据库文件失败（{error}）；备份已保留，下次启动会自动重试"))?;
 
     Ok(RestoreOutcome::Applied { safety })
+}
+
+/// 把主库旁边 `-wal` 里**已提交但还没并回主库**的事务并进去，并确认真的并干净了。
+///
+/// ── 为什么这一步不能 best-effort ──────────────────────────────
+/// 第 4 步会**无条件删掉** `-wal`，而第 3 步的 `fs::copy` 只拷主库文件、**不含
+/// `-wal` 里的内容**。所以只要这里没并干净，用户最近提交的数据就只存在于那个
+/// 即将被删掉的 `-wal` 里。正常路径上第 5 步的 `rename` 会把它一并换掉（旧库
+/// 连 WAL 一起消失，本来就要消失），但 `rename` 是**可能失败的**（Windows 上
+/// 旧进程占着文件是典型原因，见第 5 步注释）。那时主库文件名还是旧的、内容却
+/// 已经丢了尾巴 —— 既不是旧的也不是新的，而用户看到的是「恢复失败、旧数据还在」。
+/// 这正对着模块头承诺的「任何一步失败主库都原封不动」。
+///
+/// ── 为什么不能只看语句有没有报错 ──────────────────────────────
+/// `PRAGMA wal_checkpoint(TRUNCATE)` 拿不到锁时**不报错**，只在返回行里给
+/// `busy=1`（实测：持锁时返回 `{busy:1,...}`，语句本身 `Ok`）。所以
+/// `execute_batch` 成功**不等于**并干净了 —— 必须把那一行读出来。
+/// 判据只看第 1 列：后两列（`log` / `checkpointed`）随当时有没有待并的帧而变，
+/// 不作判据（非 WAL 库上是 `-1`，WAL 库上可能是 `0` 也可能是正数）。
+fn drain_wal(main: &Path) -> Result<(), String> {
+    let merged = Connection::open(main)
+        .and_then(|conn| {
+            // 第 1 列就是 busy 标志。用 query_row 而不是 execute_batch：
+            // 后者把结果行丢掉，正是看不见 busy 的原因。
+            conn.query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |row| {
+                row.get::<_, i64>(0)
+            })
+        })
+        .map(|busy| busy == 0)
+        // 连打开都失败（库被独占、权限、损坏）：同样当作「没并干净」处理，
+        // 不能因为「读不到 busy」就默认成功。
+        .unwrap_or(false);
+
+    if merged {
+        return Ok(());
+    }
+    Err(
+        "旧数据库的写入日志（-wal）没能并回主库，已放弃本次恢复以免丢失最近的数据。\
+         请确认没有另一个实例（例如 Docker 容器、或上一个还没退干净的进程）\
+         正在使用同一个数据目录，关闭它之后重试。\
+         主库与你的备份文件都未被改动。"
+            .to_string(),
+    )
+}
+
+/// 「同一时刻只有一次恢复在写 [`PENDING_FILE`]」的守卫（RAII：出作用域即释放）。
+///
+/// ── 为什么必须共享，而不是各入口自己防 ────────────────────────
+/// `PENDING_FILE` 是**一个固定路径**，而写它的入口有**两个**、跑在**同一个进程**
+/// 里：网页端的 `POST /api/db/restore`（HTTP 上传）与桌面端的 `restore_database`
+/// 命令（本地文件直接拷）。两边都会先 `remove_file` 再建文件写 —— 交错执行就是
+/// 「后到的截断前一个」，留下半截 pending，而两个入口各自已经回了话（一个说
+/// 「正在重启」、一个说别的），语义全乱；下次启动还会把半截文件当备份去换库。
+/// 守卫是进程级的 `static`，所以**两个入口共用同一把**才算真的挡住了。
+/// 放在本模块而不是 HTTP 层：不变量属于「谁拥有 PENDING_FILE」，不属于调用方。
+///
+/// 用 `AtomicBool::compare_exchange` 而不是 `Mutex`：要的是「抢到就干活、抢不到
+/// 立刻拒绝」，不是「排队等」；`try_lock` 语义用 CAS 最直白。HTTP 侧的 handler
+/// 全程有 `.await`，持锁跨 await 会拖死并发 —— CAS 不持有任何跨 await 的东西。
+///
+/// 进程重启后标志自然归零 —— 恢复本来就是「写完 pending 就退出」，
+/// 不需要跨进程的持久化互斥。
+static RESTORE_IN_FLIGHT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// [`RESTORE_IN_FLIGHT`] 的 RAII 句柄：析构即释放。
+pub struct RestoreGuard;
+
+impl RestoreGuard {
+    /// 抢到返回 `Some`，已被占用返回 `None`（调用方应当直接拒绝，让用户重试）。
+    pub fn acquire() -> Option<Self> {
+        use std::sync::atomic::Ordering;
+        RESTORE_IN_FLIGHT
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Self)
+    }
+}
+
+impl Drop for RestoreGuard {
+    fn drop(&mut self) {
+        RESTORE_IN_FLIGHT.store(false, std::sync::atomic::Ordering::Release);
+    }
 }
 
 /// 校验一份待恢复的文件是不是**能用**的 SQLite 库。
@@ -421,6 +508,51 @@ mod tests {
         assert!(!pending.exists(), "pending 应用后应消失");
         assert!(!sidecar(&main, "-wal").exists(), "旧库的 -wal 应被清掉");
         assert!(!sidecar(&main, "-shm").exists(), "旧库的 -shm 应被清掉");
+    }
+
+    /// **WAL 并不干净时必须整个放弃** —— 这是本模块最隐蔽的一条。
+    ///
+    /// 复现的是「另一个实例（Docker 容器 / 没退干净的旧进程）还占着这个库」：
+    /// 第 2 步的 checkpoint 拿不到写锁。此时若照旧往下走，第 4 步会**无条件删掉**
+    /// `-wal`，而第 3 步的副本只拷主库文件、不含 `-wal` 里的已提交事务 ——
+    /// 一旦第 5 步 rename 也失败（旧进程占着文件，正是同一原因），主库就变成
+    /// 「文件名是旧的、最近的事务已经没了」，而用户看到的是「恢复失败、旧数据还在」。
+    ///
+    /// `PRAGMA wal_checkpoint(TRUNCATE)` 拿不到锁时**不报错**，只在返回行里给
+    /// `busy=1`（实测：持写锁时返回 `{busy:1,...}`，语句本身 `Ok`）。所以这条
+    /// 路径靠「语句有没有报错」是**看不见**的 —— 本用例正是钉住这一点。
+    #[test]
+    fn aborts_when_wal_cannot_be_drained() {
+        let dir = TempDir::new("restore-wal-busy");
+        let main = dir.path().join(super::super::FILE_NAME);
+        let pending = dir.path().join(PENDING_FILE);
+        make_db(&main, "旧库");
+        make_db(&pending, "新库");
+
+        // 把主库切成 WAL 模式并留下真实的 `-wal`（make_db 的裸连接是默认
+        // journal 模式，没有 sidecar —— 那测不出这一步）。
+        {
+            let conn = Connection::open(&main).unwrap();
+            conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
+        }
+
+        // 另一个连接持写锁：checkpoint 会拿到 busy=1
+        let holder = Connection::open(&main).expect("持锁连接应能打开");
+        holder.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        holder
+            .execute("INSERT OR REPLACE INTO kv (key, value) VALUES ('held', '未提交')", [])
+            .unwrap();
+
+        let error = apply_at(dir.path()).expect_err("WAL 并不干净时必须放弃本次恢复");
+        assert!(error.contains("并回主库"), "文案应说清是 WAL 没并回去：{error}");
+
+        // 主库原封不动 —— 这正是模块头那句承诺的兑现
+        drop(holder); // 先放锁，否则下面读库可能拿不到
+        assert_eq!(read_marker(&main).as_deref(), Some("旧库"), "主库必须原封不动");
+        assert!(!dir.path().join(SAFETY_FILE).exists(), "没走到留副本那步，不该有副本");
+        // 关键：pending **保留**（与「校验不过就删」不同）—— 这是可重试的
+        // 环境问题，用户关掉那个实例后重启一次就能成
+        assert!(pending.exists(), "环境原因失败时 pending 应保留，供下次启动重试");
     }
 
     #[test]

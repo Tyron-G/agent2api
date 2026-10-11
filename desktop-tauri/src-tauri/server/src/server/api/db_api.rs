@@ -123,35 +123,6 @@ impl Drop for SnapshotGuard {
     }
 }
 
-/// 「同一时刻只有一次恢复」的守卫（RAII：出作用域即释放）。
-///
-/// 用 `AtomicBool::compare_exchange` 而不是 `Mutex`：这里要的是「抢到就干活、
-/// 抢不到立刻拒绝」，不是「排队等」，`try_lock` 语义用 CAS 最直白，也不必
-/// 持有任何跨 await 的锁（handler 全程有 `.await`，持锁跨 await 会拖死并发）。
-///
-/// 进程重启后标志自然归零 —— 恢复本来就是「写完 pending 就退出」，
-/// 不需要跨进程的持久化互斥。
-static RESTORE_IN_FLIGHT: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-struct RestoreGuard;
-
-impl RestoreGuard {
-    fn acquire() -> Option<Self> {
-        use std::sync::atomic::Ordering;
-        RESTORE_IN_FLIGHT
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .ok()
-            .map(|_| Self)
-    }
-}
-
-impl Drop for RestoreGuard {
-    fn drop(&mut self) {
-        RESTORE_IN_FLIGHT.store(false, std::sync::atomic::Ordering::Release);
-    }
-}
-
 /// POST /api/db/restore —— 网页端上传备份并恢复。
 ///
 /// 流程：**流式落盘** → 校验 → 返回「即将重启」→ 触发进程自退。
@@ -177,7 +148,11 @@ pub async fn restore_database(State(state): State<ServerState>, request: Request
     // 会截断前一个的写入，留下半截文件，而两个请求各自已经回话（一个说
     // 「正在重启」、一个说别的），语义全乱。抢不到的直接拒绝，让用户重试 ——
     // 比默默写坏一份 pending 强。
-    let Some(_restore_guard) = RestoreGuard::acquire() else {
+    //
+    // 守卫**住在 `db::restore`**（PENDING_FILE 的归属地），桌面端的
+    // `restore_database` 命令抢的是**同一把** —— 两个入口跑在同一个进程里，
+    // 各防各的挡不住它们互相踩。
+    let Some(_restore_guard) = restore::RestoreGuard::acquire() else {
         logging::log("[Restore]", "⚠️  已有一项恢复正在进行，拒绝并发请求");
         return management_error(409, "已有一项恢复正在进行，请等待其完成后重试");
     };

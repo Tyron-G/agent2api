@@ -621,13 +621,19 @@ async fn write_response_stream(
 ///      深度校验（`quick_check` + `user_version`）在启动期的
 ///      `db::restore::apply_pending` 里做，那才是替换前的最后一道闸。
 ///      这里查一道是为了**立刻**给用户反馈，不必等到重启后才发现选错了文件。
-///   3. 拷到配置目录的 `agent2api.db.restore-pending`（**同名直接覆盖**：
+///   3. 抢并发守卫（与网页端同一把）—— 抢不到直接报错，不动 pending；
+///   4. 拷到配置目录的 `agent2api.db.restore-pending`（**同名直接覆盖**：
 ///      上次没应用成功的残留由本次覆盖，语义正确 —— 用户刚选的就是他要的那份）；
-///   4. 重启进程，由启动期的 `apply_pending` 完成换库。
+///   5. 重启进程，由启动期的 `apply_pending` 完成换库。
 ///
 /// ── 为什么不在这里删 `-wal` / `-shm` ─────────────────────────
 /// 运行期数据库连接还活着（这个进程就是网关本体），删 sidecar 有风险。
 /// 那件事放在启动期的 `apply_at` 里做（那时连接还没建）。
+///
+/// ── 守卫为什么在拷完之后就能放 ───────────────────────────────
+/// 它挡的是「两个写者交错、留下半截文件」。`fs::copy` 返回即代表 pending 已是
+/// 一份**完整**的文件，此后再来一次恢复只是把它整体覆盖成另一份完整文件 ——
+/// 「后到的赢」在这里是正确语义，没必要继续占着闸。
 #[tauri::command]
 pub async fn restore_database(app: AppHandle) -> Result<Value, String> {
     let file = app
@@ -675,6 +681,20 @@ pub async fn restore_database(app: AppHandle) -> Result<Value, String> {
     let config_dir = gateway::config_dir();
     std::fs::create_dir_all(&config_dir).map_err(|error| format!("创建配置目录失败: {error}"))?;
     let pending = config_dir.join("agent2api.db.restore-pending");
+
+    // ── 并发守卫：与网页端的 `POST /api/db/restore` 抢**同一把** ──────
+    // 桌面壳本身就是网关本体，两个入口跑在同一个进程里，写的是同一个固定
+    // 路径 `agent2api.db.restore-pending`：网页端一边上传、用户在设置页一边
+    // 选文件恢复，两边交错就是「后到的截断前一个」，留下半截 pending，而两边
+    // 各自已经回了话。守卫住在 `db::restore`（PENDING_FILE 的归属地），
+    // 这里抢的是同一个进程级 `static`，所以真的互相挡得住。
+    //
+    // 在**拷文件之前**抢：抢不到就不该动 pending 分毫。
+    let Some(_restore_guard) = agent2api_server::server::db::restore::RestoreGuard::acquire()
+    else {
+        return Err("已有一项恢复正在进行，请稍候再试".to_string());
+    };
+
     std::fs::copy(&source, &pending).map_err(|error| format!("写入备份文件失败: {error}"))?;
 
     // 重启放在拷贝**之后**：`schedule_app_restart` 起一个延迟线程调
