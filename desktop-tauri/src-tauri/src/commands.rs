@@ -697,6 +697,14 @@ pub async fn restore_database(app: AppHandle) -> Result<Value, String> {
 
     std::fs::copy(&source, &pending).map_err(|error| format!("写入备份文件失败: {error}"))?;
 
+    // 与网页端 `POST /api/db/restore` 对称：用户**新提交**一次恢复，上一条
+    // 「上次恢复未完成」的告警就过期了。不清的话，从这一刻到重启后
+    // `apply_pending` 跑完之间，设置页挂的是上一轮的结论（重启很快，但没必要
+    // 留这个窗口）。放**拷贝成功之后**：拷贝失败时 pending 没写成、本次恢复
+    // 根本没提交，上一轮的告警仍然有效，不该被抹掉。
+    // 权威的清除仍在 `apply_at` 成功换库之后 —— 这里只是提前收掉过期的旧话。
+    agent2api_server::server::db::restore::clear_error();
+
     // 重启放在拷贝**之后**：`schedule_app_restart` 起一个延迟线程调
     // `app.restart()`，本命令的返回值要能先回到前端（界面才能提示「正在重启」）。
     schedule_app_restart(&app);

@@ -204,6 +204,12 @@ export type StorageState = {
   requests: number | null
   dailyDays: number | null
   debug: number | null
+  /**
+   * 上一次「恢复备份」没能换上去的原因（后端给的用户可读说明，原样透出）。
+   * null = 没有未完成的恢复 —— 恢复失败的原因原本只进了进程日志（GUI 没有控制台），
+   * 用户永远看不到；带上它，设置页才能把「为什么没恢复成功」摆到用户面前。
+   */
+  lastRestoreError: string | null
 }
 
 export type SettingsSnapshot = {
@@ -305,6 +311,7 @@ const INITIAL: SettingsSnapshot = {
     requests: null,
     dailyDays: null,
     debug: null,
+    lastRestoreError: null,
   },
   captcha: { available: true, enabled: false },
   retentionConfirm: null,
@@ -1717,6 +1724,8 @@ export function renderStorage(data?: unknown): void {
       requests: finiteOrNull(record.requests),
       dailyDays: finiteOrNull(record.dailyDays),
       debug: finiteOrNull(record.debug),
+      // 只有后端确实给了字符串才算「有未完成的恢复」，其余一律当没有
+      lastRestoreError: typeof record.lastRestoreError === 'string' ? record.lastRestoreError : null,
     },
   })
 }

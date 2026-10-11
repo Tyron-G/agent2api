@@ -179,6 +179,12 @@ pub async fn restore_database(State(state): State<ServerState>, request: Request
         return management_error(400, reason);
     }
 
+    // ── 清掉上一次的告警 ──────────────────────────────────────
+    // 必须放在校验**之后**：校验不过的请求不该抹掉上一次的结论 —— 那次失败
+    // 用户还没看见，抹掉等于把唯一的线索也删了。走到这里说明用户新提交的
+    // 这一份已经通过校验、正在落盘，旧的结论已经过期。
+    restore::clear_error();
+
     logging::log("[Restore]", "备份已接收并通过校验，即将重启以完成恢复");
 
     // ── 触发自退（在响应发出去之后）────────────────────────────

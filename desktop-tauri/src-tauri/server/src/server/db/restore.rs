@@ -71,6 +71,21 @@ pub const PENDING_FILE: &str = "agent2api.db.restore-pending";
 /// 只是「这一次恢复的回滚点」，不是备份归档（备份归档是用户自己导出的事）。
 pub const SAFETY_FILE: &str = "agent2api.db.pre-restore";
 
+/// 「上一次恢复为什么没换上去」的告警文件，供界面读取。
+///
+/// ── 为什么必须是文件，而不是数据库日志 ────────────────────────
+/// 恢复跑在**任何库访问之前**（模块头的时序说明），也就必然跑在
+/// `logging::init_store` 之前 —— 那时根本没有可写的数据库日志。而这条原因
+/// 原先只走 `logging::console_line`（本质是 `eprintln!`），桌面端是 GUI、
+/// 没有控制台，用户**永远看不到**「恢复失败了、为什么」。所以它只能落在
+/// 文件上，由 `/api/storage` 读出来带给前端。
+///
+/// ── 它代表「最近一次」的结论 ──────────────────────────────────
+/// 两个时机清掉它：`apply_at` 换库成功时、用户新提交一次恢复时
+/// （见 `api::db_api::restore_database`）。这样界面上挂着的永远是最近一次的
+/// 结论，而不是陈年旧账 —— 否则用户下次恢复成功了，旧的失败告警还在。
+pub const ERROR_FILE: &str = "agent2api.db.restore-error";
+
 /// SQLite 库文件头的 16 字节魔数。桌面壳没有 rusqlite，只能查这个做即时校验；
 /// 这里也用同一判据做第一道粗筛（比打开库便宜）。
 const SQLITE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
@@ -189,15 +204,24 @@ pub(crate) fn apply_at(dir: &Path) -> Result<RestoreOutcome, String> {
     // 始终没被动过**（我们是 copy 进来的，不是 move），所以他没丢东西。
     if let Err(reason) = validate_upload(&pending) {
         let _ = std::fs::remove_file(&pending);
-        return Err(format!("备份文件不可用，已忽略（{reason}）"));
+        // 顺手留一条告警：这条失败只在启动期发生，而启动期的日志进不了库
+        // （见 ERROR_FILE 的说明），不写文件用户就永远不知道。
+        let message = format!("备份文件不可用，已忽略（{reason}）");
+        let _ = write_error(dir, &message);
+        return Err(message);
     }
 
     // ── 第 2 步：把旧库的 WAL 并回去（**并不动就整个放弃**）────────
     // 用**短命连接**：它只活这一次 checkpoint，用完即关（关掉才轮到我们动文件）。
     // 这一步失败必须**阻断**整个恢复，不能 best-effort —— 理由见 `drain_wal`：
     // 并不动就意味着第 4 步要删的 `-wal` 里还压着用户已提交的数据。
+    // 这里展开 `?` 而不是直接冒泡：只有拿到错误值才有机会写告警文件，
+    // 返回的仍是 `drain_wal` 那条原文。
     if main.exists() {
-        drain_wal(&main)?;
+        if let Err(reason) = drain_wal(&main) {
+            let _ = write_error(dir, &reason);
+            return Err(reason);
+        }
     }
 
     // ── 第 3 步：留旧库副本 ───────────────────────────────────
@@ -205,9 +229,11 @@ pub(crate) fn apply_at(dir: &Path) -> Result<RestoreOutcome, String> {
     // 这正是与 `config_migration` 的「绝不覆盖」相反的取舍（那边是新建目标，
     // 这边就是要覆盖）。
     if main.exists() {
-        std::fs::copy(&main, &safety).map_err(|error| {
-            format!("无法保留旧库副本（{}）：{error}", safety.display())
-        })?;
+        if let Err(error) = std::fs::copy(&main, &safety) {
+            let message = format!("无法保留旧库副本（{}）：{error}", safety.display());
+            let _ = write_error(dir, &message);
+            return Err(message);
+        }
     }
 
     // ── 第 4 步：清掉属于旧库的 sidecar ───────────────────────
@@ -228,10 +254,59 @@ pub(crate) fn apply_at(dir: &Path) -> Result<RestoreOutcome, String> {
     // 要么换成、要么没换，不存在「主库被删了但新的没到位」的中间态。
     // 失败（典型是旧进程还没退干净、文件仍被锁）→ pending 留着，下次启动
     // 重试；主库与副本都完好。
-    std::fs::rename(&pending, &main)
-        .map_err(|error| format!("替换数据库文件失败（{error}）；备份已保留，下次启动会自动重试"))?;
+    if let Err(error) = std::fs::rename(&pending, &main) {
+        let message = format!("替换数据库文件失败（{error}）；备份已保留，下次启动会自动重试");
+        let _ = write_error(dir, &message);
+        return Err(message);
+    }
+
+    // 换成功了：上一条告警（如果有）已经过期，留着只会让界面挂一句假话。
+    let _ = clear_error_at(dir);
 
     Ok(RestoreOutcome::Applied { safety })
+}
+
+/// 读「上次恢复没完成」的原因；没有则 `None`。
+///
+/// 读不到（文件不存在 / 内容为空 / 不是合法 UTF-8）一律当 `None`：这个文件只是
+/// 一条告警，读不出来时界面少显示一行而已，绝不该让 `/api/storage` 跟着出错。
+///
+/// 路径口径与 [`apply_pending`] 一致（都走 `config::config_dir()`）—— 否则
+/// 写进 A 目录、从 B 目录读，界面永远看不到告警。
+pub fn last_error() -> Option<String> {
+    let text =
+        std::fs::read_to_string(crate::server::config::config_dir().join(ERROR_FILE)).ok()?;
+    let text = text.trim();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text.to_string())
+    }
+}
+
+/// 清掉告警文件。
+///
+/// 两个调用点：`apply_at` 成功换库之后、用户新提交一次恢复时
+/// （见 `api::db_api::restore_database`）。语义是「这条结论已经过期了」。
+pub fn clear_error() {
+    let _ = clear_error_at(&crate::server::config::config_dir());
+}
+
+/// 把「这次为什么没换上去」落到告警文件（`{dir}/{ERROR_FILE}`）。
+///
+/// 返回 `io::Result` 而不是自己吞掉错误，是为了让每个调用点显式写出 `let _ =` ——
+/// 那个下划线正是本次改动的纪律：告警只是锦上添花，绝不能因为它写不出去
+/// （磁盘满、目录只读）而改变恢复本身的成败。
+///
+/// 接 `dir` 而不是内部取 `config_dir()`：`apply_at` 是可测版本（接 `&Path`），
+/// 若在这里读真实配置目录，测试会把告警写到用户的真实配置目录里去。
+fn write_error(dir: &Path, reason: &str) -> std::io::Result<()> {
+    std::fs::write(dir.join(ERROR_FILE), reason)
+}
+
+/// 删掉告警文件。删不掉就拉倒（残留最多让界面多挂一条告警）。
+fn clear_error_at(dir: &Path) -> std::io::Result<()> {
+    std::fs::remove_file(dir.join(ERROR_FILE))
 }
 
 /// 把主库旁边 `-wal` 里**已提交但还没并回主库**的事务并进去，并确认真的并干净了。

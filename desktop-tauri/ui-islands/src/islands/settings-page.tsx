@@ -1555,6 +1555,17 @@ function DataPane({ snap }: { snap: SettingsSnapshot }) {
           }
         />
         <div className='panel-body'>
+          {/* 恢复失败的原因原本只进进程日志，GUI 没有控制台 → 用户永远不知道；
+              后端把它带在存储概况里，这里非空即显示（原因原样透出，不改写不截断） */}
+          {storage.lastRestoreError ? (
+            <div className='danger-zone'>
+              <strong>{t('上次恢复未完成')}</strong>
+              <br />
+              {storage.lastRestoreError}
+              <br />
+              {t('数据库保持原样未变，你的备份文件也未被改动。可在此重新选择备份恢复。')}
+            </div>
+          ) : null}
           <div className='danger-zone'>
             <strong>{t('备份文件是整个数据库，内含全部账号凭证、网关 Key、自定义提供商定义与面板管理员密码哈希')}</strong>
             {t('，可直接用于登录。请妥善保管，不要外传或上传到公共位置。恢复是整体替换：当前数据库会被完全覆盖，恢复前会自动留一份替换前的副本。')}

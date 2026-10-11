@@ -102,6 +102,10 @@ pub async fn get_storage(State(state): State<ServerState>) -> Response {
             "requests": requests,
             "dailyDays": daily_days,
             "debug": crate::server::core::debug_traffic::count(),
+            // 上次恢复没换上去的原因（`null` = 没有未完成的恢复）。
+            // 这个 handler 每次调用都现算、没有任何缓存，所以直接读文件即可，
+            // 不必另存一份状态 —— 也就不会出现「文件已清掉、状态还挂着」的分叉。
+            "lastRestoreError": crate::server::db::restore::last_error(),
         },
     }))
 }
