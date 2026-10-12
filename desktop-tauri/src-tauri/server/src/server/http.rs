@@ -911,20 +911,42 @@ async fn require_api_key(mut request: Request, next: Next) -> Response {
     //
     // 两个例外必须放行，否则闸门会把既有部署形态打断：
     //   · **兼容模式**（AGENT2API_PROXY_API_KEY 预置了 Key、无管理员）：
-    //     Key 本来就是这类部署的管理凭证（桌面壳/脚本自动带），闸门必须
-    //     先试 Key 再拒绝；
+    //     Key 是这类部署唯一的凭证（桌面壳/脚本自动带），闸门必须先试
+    //     Key 再拒绝；
     //   · `/api/panel/` 前缀：注册 / 状态 / 登录本身就在这个前缀里。
     //
-    // ⚠️ **兼容模式的边界（有意保留，不是漏网）**：这里放行 Key 是**不分来源**的
-    // —— 因为该模式下没有「管理员」这层更高权限，Key 就是唯一凭证，提权无从谈起。
-    // 代价是：**这种部署不能把 Key 发给用户**（发出去就等于交出管理面）。
-    // 中转站务必先注册管理员 —— 注册后本分支不再生效，管理接口改由上面的
-    // panel_auth 分支接管，Key 随之被限制在本机（`peer_is_loopback`）。
+    // ⚠️ **兼容模式下的 Key 同样仅限本机**（与上面的 panel_auth 分支同一判据）。
+    // 这里曾经「不分来源」放行，理由是「没有管理员这层更高权限，提权无从谈起」——
+    // 该理由只对**本机**成立。真实的失败形态是：一台 headless 部署预置了 Key 而
+    // 没注册管理员，操作者把这把 Key 填进另一台机器上的上游网关（如 new-api 的
+    // 渠道配置），于是那台机器握有完整管理权 —— 读全部 Key 明文、上游凭证，
+    // 还能整库下载。Key 一旦要离开本机，「Key 即管理凭证」就不再是自洽的设定。
+    //
+    // 代价：未注册管理员时不能从远程机器 curl 管理接口。这是**刻意**的 ——
+    // 远程管理该走管理员账号密码（`change_lan_access` 本就把「注册管理员」
+    // 作为开局域网访问的前提）。`/api/panel/` 前缀不受影响，远程仍可完成注册，
+    // 注册后本分支不再生效，管理接口改由上面的 panel_auth 分支接管。
     if !panel_auth && crate::server::access::panel_gate() && path.starts_with("/api/") {
-        if !path.starts_with("/api/panel/")
-            && !(keys.iter().any(|expected| request_matches_key(&request, expected)))
-        {
-            return errors::panel_login_required_response();
+        if !path.starts_with("/api/panel/") {
+            let key_matched = keys
+                .iter()
+                .any(|expected| request_matches_key(&request, expected));
+            if !key_matched {
+                return errors::panel_login_required_response();
+            }
+            if !peer_is_loopback(&request) {
+                // 与 panel_auth 分支同一条留痕：这是**有效 Key 从非本机打管理
+                // 接口**，是安全事件而非配置问题，必须与「真没带凭证」分开。
+                logging::log(
+                    "[Security]",
+                    &format!(
+                        "🚫 拒绝非本机来源的网关 Key 访问管理接口: {} {path}（来源={}，未注册管理员的兼容模式）",
+                        request.method(),
+                        describe_peer(&request),
+                    ),
+                );
+                return errors::panel_login_required_response();
+            }
         }
         return next.run(request).await;
     }
@@ -1252,6 +1274,14 @@ mod panel_key_loopback_tests {
             .layer(middleware::from_fn(require_api_key))
     }
 
+    /// 带 `/api/panel/` 前缀的探针：未注册闸门对**认证边界端点**是另一条分支
+    /// （注册/登录必须免鉴权，否则部署完根本注册不了管理员）。
+    fn auth_probe_router_with_panel_path() -> Router {
+        Router::new()
+            .route("/api/panel/setup", post(|| async { "ok" }))
+            .layer(middleware::from_fn(require_api_key))
+    }
+
     async fn call_auth(router: &Router, request: Request) -> StatusCode {
         router
             .clone()
@@ -1261,8 +1291,96 @@ mod panel_key_loopback_tests {
             .status()
     }
 
+    /// **必须排在 `management_interface_accepts_keys_only_from_loopback` 之前**
+    /// （见那个用例末尾的复位说明），也不能单独拆成一个 `#[tokio::test]`：
+    /// 两处都依赖同一份进程级全局状态。
+    ///
+    /// 覆盖未注册闸门（headless 的兼容模式：预置了 Key、没注册管理员）。
+    /// 这条分支原先**不分来源**放行 Key，理由是「没有管理员这层更高权限，
+    /// 提权无从谈起」—— 该理由只对本机成立：把 Key 填进另一台机器的上游网关
+    /// 配置后，那台机器就握有完整管理权。现在与已注册分支同一判据（仅回环）。
+    async fn compatibility_mode_restricts_keys_to_loopback() {
+        let (db, _guard) = crate::server::db::test_temp::TempDb::open("panel-key-compat");
+        crate::server::access::attach_db(Some(db.clone()));
+        // 库已挂、但**没有** `kv.panelAdmin` ⇒ `panel_auth_enabled()` 为假
+        crate::server::access::set_panel_gate(true);
+        crate::server::config::init(Some(db.clone()));
+        crate::server::config::set_api_key(Some(KEY.to_string()));
+
+        assert!(
+            !crate::server::access::panel_auth_enabled(),
+            "兼容模式的前提就是「没有管理员」"
+        );
+        assert!(crate::server::access::panel_gate());
+
+        let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5555);
+        let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 3, 5)), 5555);
+        let router = auth_probe_router();
+        let good_key = [("x-api-key", KEY)];
+
+        // ① 本机 + 有效 Key → 放行（桌面壳/本机脚本这条路必须通）
+        assert_eq!(
+            call_auth(&router, request_with(Some(local), &good_key)).await,
+            StatusCode::OK,
+            "兼容模式下本机的有效 Key 必须放行"
+        );
+
+        // ② 非本机 + 有效 Key → **拒绝**。这条是本轮收紧的那个洞。
+        assert_eq!(
+            call_auth(&router, request_with(Some(remote), &good_key)).await,
+            StatusCode::UNAUTHORIZED,
+            "兼容模式下非本机的有效 Key 也不得进管理接口"
+        );
+
+        // ③ 非本机 + 有效 Key + 转发头 → 拒绝（同机反代不得伪装回环）
+        assert_eq!(
+            call_auth(
+                &router,
+                request_with(
+                    Some(local),
+                    &[("x-api-key", KEY), ("x-forwarded-for", "1.2.3.4")]
+                )
+            )
+            .await,
+            StatusCode::UNAUTHORIZED
+        );
+
+        // ④ 取不到来源 + 有效 Key → 拒绝（fail-closed）
+        assert_eq!(
+            call_auth(&router, request_with(None, &good_key)).await,
+            StatusCode::UNAUTHORIZED
+        );
+
+        // ⑤ 不带凭证 → 拒绝（闸门原本的语义，不回归）
+        assert_eq!(
+            call_auth(&router, request_with(Some(remote), &[])).await,
+            StatusCode::UNAUTHORIZED
+        );
+
+        // ⑥ `/api/panel/setup` 在**远程、无凭证**下仍必须放行 —— 否则部署完
+        //    没法注册管理员，收紧就成了把自己锁在门外。这条是本次改动最
+        //    容易被顺手破坏的边界（`/api/panel/` 前缀的豁免必须留在 Key 判定之前）。
+        let panel_router = auth_probe_router_with_panel_path();
+        let mut register = Request::builder()
+            .method(Method::POST)
+            .uri("/api/panel/setup")
+            .body(Body::empty())
+            .expect("请求构造不应失败");
+        register.extensions_mut().insert(ConnectInfo(remote));
+        assert_eq!(
+            call_auth(&panel_router, register).await,
+            StatusCode::OK,
+            "远程必须仍能完成首次注册（认证边界端点免鉴权）"
+        );
+    }
+
     #[tokio::test]
     async fn management_interface_accepts_keys_only_from_loopback() {
+        // 先跑兼容模式那段：它需要「尚未注册管理员」这个**更早**的状态，
+        // 而下面注册之后就回不去了（`access::attach_db` 的库句柄是 `OnceLock`，
+        // `panel_auth_enabled()` 只能由假变真）。
+        compatibility_mode_restricts_keys_to_loopback().await;
+
         let (db, _guard) = crate::server::db::test_temp::TempDb::open("panel-key-loopback");
         crate::server::access::attach_db(Some(db.clone()));
         // 配置快照是进程级 `OnceLock`：重装一次，让本用例读到「这台库 + 一把已知 Key」。
@@ -1333,9 +1451,11 @@ mod panel_key_loopback_tests {
         );
 
         // 复位配置快照，别把「这把 Key」留给同进程的其它用例。
-        // `panel_auth` 无法复位（`access::attach_db` 的库句柄是 `OnceLock`），
-        // 但已核实**没有任何其它用例读它**（`set_api_key` 的唯一测试外调用点是
-        // `config_api`），所以影响面为零。
+        // `panel_auth` 与 `panel_gate` 无法复位（`access::attach_db` 的库句柄是
+        // `OnceLock`，只能由假变真；`panel_gate` 是全局原子量），但已核实**没有
+        // 任何其它用例读它们**，所以影响面为零 —— 唯一要注意的是顺序：本用例
+        // 把进程推到了「已注册管理员」这个终态，任何需要「未注册」前提的用例
+        // 都必须跑在它之前（兼容模式那段就写在本用例开头，见那里的说明）。
         crate::server::config::set_api_key(None);
     }
 }

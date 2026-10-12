@@ -117,6 +117,21 @@ fn main() -> ExitCode {
     // 纯内网确要无 Key 裸跑的，显式设 AGENT2API_ALLOW_NO_KEY=1 自己负责。
     if !config::current().active_api_keys().is_empty() {
         logging::log("[Security]", "API Key 认证已启用");
+        // 兼容模式（预置了 Key 但没注册管理员）：不拦，但要说清这把 Key 的边界。
+        // 管理接口的 Key 通道**仅限本机**（`http::require_api_key` 的两条分支同
+        // 一判据）—— 这把 Key 可以发给用户走 `/v1/*`，但拿它从别的机器打
+        // `/api/*` 会被拒。不说的话，操作者只会在远程管理失败时拿到一个
+        // 没头没尾的 401。
+        if !agent2api_server::server::access::panel_auth_enabled() {
+            logging::log(
+                "[Security]",
+                "⚠️  未注册面板管理员：管理接口（/api/*）的网关 Key 通道仅限本机来源 —— 这把 Key 可发给用户走 /v1/*，但不能用于远程管理",
+            );
+            logging::log(
+                "[Security]",
+                "    需要远程管理请打开 http://<面板地址>/login 注册管理员（注册端点本身免鉴权），注册后改用账号密码登录",
+            );
+        }
     } else if std::env::var("AGENT2API_ALLOW_NO_KEY")
         .map(|v| v.trim() == "1")
         .unwrap_or(false)
@@ -142,7 +157,7 @@ fn main() -> ExitCode {
             );
             logging::log(
                 "[Security]",
-                "    /v1/* 已进入 fail-closed（拒绝服务）；管理接口在注册完成前不校验来源，注册后立即要求登录",
+                "    /v1/* 已进入 fail-closed（拒绝服务）；管理接口除注册/登录等认证边界端点外一律拒绝，注册后立即要求登录",
             );
         }
     }
