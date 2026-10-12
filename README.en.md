@@ -87,7 +87,7 @@ print(resp.choices[0].message.content)
 
 ### LAN access
 
-By default the gateway only listens on `127.0.0.1`. After turning on "Settings → General → LAN access" it listens on all adapters, and devices on the LAN just point their API base URL at this machine's IP (the UI shows the full address) to share the accounts. For safety, enabling it requires registering a panel administrator first: the management API then demands an admin session or a gateway key, and with no key enabled the forwarding API refuses service too (the enable flow adds a "default" key automatically). The web panel can optionally be exposed to the LAN as well (off by default). Changes take effect after a restart.
+By default the gateway only listens on `127.0.0.1`. After turning on "Settings → General → LAN access" it listens on all adapters, and devices on the LAN just point their API base URL at this machine's IP (the UI shows the full address) to share the accounts. For safety, enabling it requires registering a panel administrator first: the management API then demands an admin session, **or a gateway key that arrives from this machine** (a key is a general-purpose credential for `/v1/*` only; reaching `/api/*` with one requires the request to come from `127.0.0.1`), and with no key enabled the forwarding API refuses service too (the enable flow adds a "default" key automatically). The web panel can optionally be exposed to the LAN as well (off by default). Changes take effect after a restart.
 
 ---
 
@@ -361,6 +361,10 @@ Do not use this project for any commercial purpose, for redistributing it for pr
 ### Credentials and data risk
 
 This project stores account credentials (`accessToken` / `refreshToken`, etc.) as **plain text** in the SQLite database `agent2api.db` inside the local configuration directory (by default `~/.agent2api/`), and the `.db` file exported by the whole-database backup is a **complete copy of that database** — besides account credentials it also contains gateway Keys, custom provider definitions, the panel administrator's password hash and the login CAPTCHA (ALTCHA) key. In other words, holding this backup is equivalent to holding **every identity and setting** of this instance: keep it safe, and never commit it to a public repository, upload it to cloud storage or share it with others. Losses caused by leaked credentials are borne by the user.
+
+**A gateway Key is not a user credential.** It is the gateway's own admission credential: anyone holding it can forward through `/v1/*`, but when it comes to the management API (`/api/*`) **only requests from this machine (a loopback address) are accepted** — the same key used from another host or container gets a 401 on `/api/*`. So do not hand it out as if it were an ordinary user key; conversely, giving it to someone else does not hand over administrative control. For the same reason, **do not expose the panel port through a reverse proxy**: a reverse proxy rewrites the source address to loopback and thereby bypasses this restriction (this gateway does not honour forwarding headers such as `X-Forwarded-For` — a request carrying one never counts as local). Use the administrator account and password to log into the panel when you need remote management.
+
+There is also a **compatibility mode** deployment: only `AGENT2API_PROXY_API_KEY` is preset and **no panel administrator is registered**. In that state there is no "higher privilege" for a key to escalate to — the key is the only credential — so it is accepted **regardless of source**. Such a deployment **must not hand its key out to users**, or it hands over the management surface. To open it up for multiple users, register an administrator first (or preset one with `AGENT2API_ADMIN_USER` / `AGENT2API_ADMIN_PASSWORD_HASH`); once registered, this mode exits on its own and the key is restricted to this machine.
 
 ### No warranty and rights notice
 

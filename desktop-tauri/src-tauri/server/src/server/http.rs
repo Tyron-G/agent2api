@@ -30,13 +30,14 @@
 //! `/api/accounts/{*rest}` 这种通配（它会与方法不匹配检查互相干扰）。
 //! 因此这里把每条子路径显式列出来。
 
-use axum::extract::Request;
+use axum::extract::{ConnectInfo, Request};
 use axum::http::{header, HeaderValue, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, patch, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
+use std::net::SocketAddr;
 
 use crate::server::api;
 use crate::server::errors;
@@ -717,6 +718,78 @@ fn attach_cors(headers: &mut axum::http::HeaderMap) {
     }
 }
 
+/// 这次连接是否来自本机回环 —— 管理接口上「Key 通道」的准入判据。
+///
+/// ── 为什么需要它（越权修复）────────────────────────────────
+/// `/api/*` 原先认「会话**或任意一把 Key**」，于是任意一把网关 Key 都是完整
+/// 管理员权限（能读全部 Key 明文、上游凭证，还能整库下载）。而 Key 恰恰是
+/// **要发给用户的东西**（填进上游网关的渠道配置），对中转站等于把管理权一起
+/// 发了出去。桌面壳与服务端同进程、且永远只连 `127.0.0.1`（`gateway.rs:205`），
+/// 所以「Key 通道仅限本机」对壳恒真、对远程持 Key 者一律拒绝。
+///
+/// ── 取不到地址时 fail-closed ───────────────────────────────
+/// 生产路径两个 serve 都装了 `into_make_service_with_connect_info`
+/// （`mod.rs:1039` 同端口 / `mod.rs:1073` 分端口），取不到只可能是「路由被挂到
+/// 不带 ConnectInfo 的地方」或测试里的 `oneshot` —— 两种都不该被当成「本机」。
+///
+/// ── 带转发头一律不认 ───────────────────────────────────────
+/// 本仓没有任何 `X-Forwarded-For` 处理（无既有反代信任政策），所以出现转发头
+/// 只可能是中间有代理；此时 `ConnectInfo` 看到的是**代理**的地址，回环不可信。
+/// 直连的桌面壳从不带这些头（`gateway.rs:215-218` 只发 Accept / X-API-Key /
+/// Content-Type）。
+///
+/// ⚠️ 这条只挡「配了转发头的代理」。同机反代**不配** `proxy_set_header
+/// X-Forwarded-For` 时仍会被判成回环 —— 真正的防线是**别把面板端口经反代
+/// 暴露**（见 README 的部署约束），不要把本函数当成那道防线的替代。
+fn peer_is_loopback(request: &Request) -> bool {
+    if has_forwarding_headers(request.headers()) {
+        return false;
+    }
+    request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .is_some_and(|ConnectInfo(addr)| addr_is_loopback(addr))
+}
+
+/// 是否带了转发类请求头（`X-Forwarded-For` / 标准 `Forwarded`）。
+///
+/// 只查这两个：`X-Real-IP` 不是标准头、本仓也从不产生它，加进来只会误伤
+/// 那些无害透传它的客户端，而挡不住真正想绕过的代理（那种代理什么头都能配）。
+fn has_forwarding_headers(headers: &axum::http::HeaderMap) -> bool {
+    headers.contains_key("x-forwarded-for") || headers.contains_key("forwarded")
+}
+
+/// 纯地址判定：回环 + **v4-mapped v6 解包**。
+///
+/// `::ffff:127.0.0.1` 经 `SocketAddr::V6` 到达时 `IpAddr::is_loopback()` 返回
+/// **false**（它只按「是不是 `::1`」判），而双栈监听下本机 IPv4 连接正是以这个
+/// 形态出现的 —— 不解包会让桌面壳被自己的规则拒掉。
+fn addr_is_loopback(addr: &SocketAddr) -> bool {
+    match addr.ip() {
+        std::net::IpAddr::V4(v4) => v4.is_loopback(),
+        std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4.is_loopback(),
+            None => v6.is_loopback(),
+        },
+    }
+}
+
+/// 诊断用的来源描述。**只进日志，不回给客户端** —— 别把内部地址形态透给
+/// 一个刚刚被拒的未授权方。
+fn describe_peer(request: &Request) -> String {
+    match request.extensions().get::<ConnectInfo<SocketAddr>>() {
+        Some(ConnectInfo(addr)) => {
+            let forwarded = if has_forwarding_headers(request.headers()) {
+                "，带转发头"
+            } else {
+                ""
+            };
+            format!("{addr}{forwarded}")
+        }
+        None => "未知（无 ConnectInfo）".to_string(),
+    }
+}
+
 /// API Key 检查中间件，逻辑照抄 Node 版 checkApiKey：
 ///   - 未配置 key → 全部放行（网关只监听 127.0.0.1）
 ///   - 配置了 key → 请求头 `Authorization: Bearer <key>` 或 `x-api-key: <key>`
@@ -754,22 +827,35 @@ async fn require_api_key(mut request: Request, next: Next) -> Response {
 
     // ── 面板认证（headless 配置了管理员时启用）──────────────────
     // `/api/*` 认「会话 cookie（人，账号密码换来）」或「API Key（程序，
-    // 桌面壳/脚本自动带）」。两者都没有 → 401 并注明是面板登录 ——
-    // web_shim 据此弹账号密码框而不是 Key 框。桌面形态不开这个开关
-    // （未配置管理员环境变量），下面的原有语义原样生效。
+    // 桌面壳自动带）」。**Key 这一路仅限本机回环**（见 `peer_is_loopback`）——
+    // 壳与服务端同进程、只连 127.0.0.1，所以对壳无影响；远程持 Key 者不得
+    // 进管理面。两者都没有 → 401 并注明是面板登录 —— web_shim 据此弹账号
+    // 密码框而不是 Key 框。桌面形态不开这个开关（未配置管理员环境变量），
+    // 下面的原有语义原样生效。
     let panel_auth = crate::server::access::panel_auth_enabled();
     if panel_auth && path.starts_with("/api/") {
         if crate::server::access::session_valid(request.headers()) {
             return next.run(request).await;
         }
-        if !keys.is_empty()
+        // Key 通道**仅限本机**（见 [`peer_is_loopback`]）。
+        //
+        // 桌面壳与服务端同进程、且永远只连 `127.0.0.1`（`gateway.rs:205`），
+        // 所以对壳这条通道恒真 —— 它在这里不是被削弱，而是被**精确描述**。
+        // 反过来，远程持 Key 者不能借此进管理面：那正是越权 ——
+        // Key 是要发给用户的凭据（填进 new-api 渠道配置），而管理面能读
+        // 全部 Key 明文、上游凭证，还能整库下载，二者不可共存。
+        let key_matched = !keys.is_empty()
             && keys
                 .iter()
-                .any(|expected| request_matches_key(&request, expected))
-        {
-            // Key 也能操作管理接口（桌面壳 / 脚本自动化的通道）
+                .any(|expected| request_matches_key(&request, expected));
+        if key_matched && peer_is_loopback(&request) {
             return next.run(request).await;
         }
+        // 走到这里两种情形都要留痕，且必须能分开：
+        //   · 远程持有效 Key → 是**被回环规则拒掉的越权尝试**，不是「没带凭证」；
+        //   · 真没带凭证 → 登录页探测的常规噪声。
+        // 旧文案把前者也写成「面板会话无效」，现场会把一次越权尝试读成配置问题。
+        let remote_key_rejected = key_matched;
         // 诊断：面板认证分支的 401 此前是静默的 —— 「登录成功却被弹回登录
         // 页」时这一行是唯一现场：两路凭证（cookie / 请求头）各自看到了什么，
         // 一眼定位是令牌没送到还是没存上。登录页每次加载的 /api/session 探测
@@ -801,6 +887,19 @@ async fn require_api_key(mut request: Request, next: Next) -> Response {
                 if seen_headers.is_empty() { "无".to_string() } else { seen_headers.join("+") },
             ),
         );
+        // 越权尝试单独再记一条：上面那条是「面板会话无效」的通用现场，
+        // 混在登录页探测的噪声里会被漏掉 —— 而这一条是**有效 Key 从非本机
+        // 打管理接口**，是必须被看见的安全事件（不是配置问题）。
+        if remote_key_rejected {
+            logging::log(
+                "[Security]",
+                &format!(
+                    "🚫 拒绝非本机来源的网关 Key 访问管理接口: {} {path}（来源={}）",
+                    request.method(),
+                    describe_peer(&request),
+                ),
+            );
+        }
         return errors::panel_login_required_response();
     }
     // ── 未注册闸门（headless 专属，桌面壳不开启）────────────────
@@ -815,6 +914,12 @@ async fn require_api_key(mut request: Request, next: Next) -> Response {
     //     Key 本来就是这类部署的管理凭证（桌面壳/脚本自动带），闸门必须
     //     先试 Key 再拒绝；
     //   · `/api/panel/` 前缀：注册 / 状态 / 登录本身就在这个前缀里。
+    //
+    // ⚠️ **兼容模式的边界（有意保留，不是漏网）**：这里放行 Key 是**不分来源**的
+    // —— 因为该模式下没有「管理员」这层更高权限，Key 就是唯一凭证，提权无从谈起。
+    // 代价是：**这种部署不能把 Key 发给用户**（发出去就等于交出管理面）。
+    // 中转站务必先注册管理员 —— 注册后本分支不再生效，管理接口改由上面的
+    // panel_auth 分支接管，Key 随之被限制在本机（`peer_is_loopback`）。
     if !panel_auth && crate::server::access::panel_gate() && path.starts_with("/api/") {
         if !path.starts_with("/api/panel/")
             && !(keys.iter().any(|expected| request_matches_key(&request, expected)))
@@ -1056,6 +1161,183 @@ pub fn parse_query_ms(value: Option<&String>) -> Option<i64> {
         return None;
     }
     Some(number as i64)
+}
+
+#[cfg(test)]
+mod panel_key_loopback_tests {
+    //! 管理接口上「Key 通道仅限本机」的回归用例。
+    //!
+    //! ── 背景 ──────────────────────────────────────────────────
+    //! 修复前 `/api/*` 认「会话**或任意一把 Key**」，于是任意一把网关 Key 都是
+    //! 完整管理员权限：读全部 Key 明文、上游凭证，还能整库下载。而 Key 恰恰是
+    //! **要发给用户的凭据**（填进上游网关的渠道配置），二者不可共存。
+    //! 现在 Key 这一路要求来源是回环（桌面壳与服务端同进程、只连 127.0.0.1）。
+    //!
+    //! ── 为什么分两组 ──────────────────────────────────────────
+    //! `addr_is_loopback` / `peer_is_loopback` 是纯函数，各自独立成例、可并行；
+    //! 中间件级断言依赖 `panel_auth`（读库）与配置快照（进程级 `OnceLock`）
+    //! 两个**全局状态**，按 `cors_tests` 的既有约定必须写在**同一个用例**里
+    //! （`#[tokio::test]` 并行会互相干扰），且用库句柄而不是环境变量构造 ——
+    //! 环境变量一设上，同进程的其它用例会看到另一个世界。
+
+    use super::*;
+    use axum::body::Body;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use tower::ServiceExt;
+
+    /// 用例用的网关 Key。明文即可 —— 这里测的是「来源判定」不是「密钥强度」。
+    const KEY: &str = "sk-a2a-loopback-test-key";
+
+    // ── 第一组：纯判定（无全局状态，可并行）────────────────────
+
+    #[test]
+    fn addr_is_loopback_covers_the_v4_mapped_v6_form() {
+        // 双栈监听下本机 IPv4 连接是以 `::ffff:127.0.0.1` 到达的，而
+        // `IpAddr::is_loopback()` 只认 `::1`，对它返回 false —— 必须先解包。
+        // 漏了这条，桌面壳会被自己的规则拒掉。
+        let mapped: Ipv6Addr = "::ffff:127.0.0.1".parse().expect("v4-mapped 地址可解析");
+        let cases: [(SocketAddr, bool); 6] = [
+            (SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080), true),
+            (SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 8080), true),
+            (SocketAddr::new(IpAddr::V6(mapped), 8080), true),
+            (SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 3, 5)), 8080), false),
+            (SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 8080), false),
+            (SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 8080), false),
+        ];
+        for (addr, want) in cases {
+            assert_eq!(addr_is_loopback(&addr), want, "地址 {addr} 的判定不符");
+        }
+    }
+
+    /// 造一个带（或不带）`ConnectInfo` 与若干请求头的请求。
+    /// 不走 TCP —— 直接往 extensions 里插，与 `cors_tests` 的 `oneshot` 同路数。
+    fn request_with(addr: Option<SocketAddr>, headers: &[(&str, &str)]) -> Request {
+        let mut builder = Request::builder().method(Method::GET).uri("/api/keys");
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let mut request = builder.body(Body::empty()).expect("请求构造不应失败");
+        if let Some(addr) = addr {
+            request.extensions_mut().insert(ConnectInfo(addr));
+        }
+        request
+    }
+
+    #[test]
+    fn peer_is_loopback_requires_connect_info_and_no_forwarding_headers() {
+        let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5555);
+        let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 3, 5)), 5555);
+
+        assert!(peer_is_loopback(&request_with(Some(local), &[])));
+        assert!(!peer_is_loopback(&request_with(Some(remote), &[])));
+        // 取不到地址时 fail-closed：宁拒不放（生产路径两个 serve 都装了 ConnectInfo）
+        assert!(!peer_is_loopback(&request_with(None, &[])));
+        // 带转发头一律不认回环 —— 此时 ConnectInfo 看到的是**代理**的地址
+        assert!(!peer_is_loopback(&request_with(
+            Some(local),
+            &[("x-forwarded-for", "1.2.3.4")]
+        )));
+        assert!(!peer_is_loopback(&request_with(
+            Some(local),
+            &[("forwarded", "for=1.2.3.4")]
+        )));
+    }
+
+    // ── 第二组：中间件级（全局状态，全部断言写在同一个用例里）──
+
+    /// 与 `protected` 组同构的最小路由：业务恒 200，只观察 `require_api_key`。
+    fn auth_probe_router() -> Router {
+        Router::new()
+            .route("/api/keys", get(|| async { "ok" }))
+            .layer(middleware::from_fn(require_api_key))
+    }
+
+    async fn call_auth(router: &Router, request: Request) -> StatusCode {
+        router
+            .clone()
+            .oneshot(request)
+            .await
+            .expect("Router 的错误类型是 Infallible")
+            .status()
+    }
+
+    #[tokio::test]
+    async fn management_interface_accepts_keys_only_from_loopback() {
+        let (db, _guard) = crate::server::db::test_temp::TempDb::open("panel-key-loopback");
+        crate::server::access::attach_db(Some(db.clone()));
+        // 配置快照是进程级 `OnceLock`：重装一次，让本用例读到「这台库 + 一把已知 Key」。
+        crate::server::config::init(Some(db.clone()));
+        crate::server::config::set_api_key(Some(KEY.to_string()));
+        // 管理员注册 = `panel_auth_enabled()` 为真 —— 本用例要测的正是那个分支。
+        // 写库而不是设环境变量：环境变量会污染同进程的其它用例。
+        assert!(
+            crate::server::access::setup_admin("lab", "hash").expect("写入管理员"),
+            "本用例要求从「未注册」起步"
+        );
+        assert!(crate::server::access::panel_auth_enabled());
+
+        let local = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 5555);
+        let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 3, 5)), 5555);
+        let router = auth_probe_router();
+        let good_key = [("x-api-key", KEY)];
+
+        // ① 本机 + 有效 Key → 放行。桌面壳就靠这条通道，必须保持可用。
+        assert_eq!(
+            call_auth(&router, request_with(Some(local), &good_key)).await,
+            StatusCode::OK,
+            "回环来源的有效 Key 必须放行 —— 桌面壳靠它访问管理 API"
+        );
+
+        // ② 非本机 + 有效 Key → 拒绝。这就是越权修复本身。
+        assert_eq!(
+            call_auth(&router, request_with(Some(remote), &good_key)).await,
+            StatusCode::UNAUTHORIZED,
+            "非本机的有效 Key 不得进管理接口"
+        );
+
+        // ③ 取不到来源 + 有效 Key → 拒绝（fail-closed）
+        assert_eq!(
+            call_auth(&router, request_with(None, &good_key)).await,
+            StatusCode::UNAUTHORIZED
+        );
+
+        // ④ 本机 + 有效 Key + 转发头 → 拒绝（同机反代不得伪装回环）
+        assert_eq!(
+            call_auth(
+                &router,
+                request_with(
+                    Some(local),
+                    &[("x-api-key", KEY), ("x-forwarded-for", "1.2.3.4")]
+                )
+            )
+            .await,
+            StatusCode::UNAUTHORIZED
+        );
+
+        // ⑤ 本机 + 错的 Key → 仍是 401（原有语义不回归）
+        assert_eq!(
+            call_auth(&router, request_with(Some(local), &[("x-api-key", "sk-a2a-wrong")])).await,
+            StatusCode::UNAUTHORIZED
+        );
+
+        // ⑥ 本机 + 完全不带凭证 → 401（登录页探测的常规路径）
+        assert_eq!(
+            call_auth(&router, request_with(Some(local), &[])).await,
+            StatusCode::UNAUTHORIZED
+        );
+
+        // ⑦ 非本机 + 不带凭证 → 401
+        assert_eq!(
+            call_auth(&router, request_with(Some(remote), &[])).await,
+            StatusCode::UNAUTHORIZED
+        );
+
+        // 复位配置快照，别把「这把 Key」留给同进程的其它用例。
+        // `panel_auth` 无法复位（`access::attach_db` 的库句柄是 `OnceLock`），
+        // 但已核实**没有任何其它用例读它**（`set_api_key` 的唯一测试外调用点是
+        // `config_api`），所以影响面为零。
+        crate::server::config::set_api_key(None);
+    }
 }
 
 #[cfg(test)]

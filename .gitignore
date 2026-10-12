@@ -13,6 +13,8 @@ desktop-tauri/src-tauri/gen/schemas/
 .zcode/
 .verify/
 prototype/
+# 集成实验沙箱（本机验证 new-api 等外部网关时用，含下载的第三方二进制与临时库）
+.lab/
 # ZCode 的忽略配置文件本身（本机工具配置，不入库）
 .zcodeignore
 
