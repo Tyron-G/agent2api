@@ -793,7 +793,7 @@ impl AnthropicStream {
             "message_delta",
             json!({
                 "delta": { "stop_reason": stop_reason, "stop_sequence": Value::Null },
-                "usage": { "output_tokens": self.output_tokens() },
+                "usage": self.final_usage(),
             }),
         ));
         out.push(self.event("message_stop", json!({})));
@@ -806,6 +806,56 @@ impl AnthropicStream {
             .and_then(|usage| usage.get("completion_tokens"))
             .and_then(Value::as_i64)
             .unwrap_or(0)
+    }
+
+    /// 收尾帧的 usage —— **必须**带上 `input_tokens`（与缓存两项）。
+    ///
+    /// ── 为什么不能照 Anthropic 官方只报 `output_tokens` ──────────
+    /// 官方语义里 input 归 `message_start` 报，所以 `message_start` 必须带真值。
+    /// 但本机的 Chat 上游把 usage **只放在最后一帧**，而 `message_start` 是
+    /// **首帧**（见 `emit_start`）——发它的时候 `self.usage` 还是 None，
+    /// `input_tokens` 只能写 0 占位。**真实输入 token 到收尾时才拿到**，
+    /// 若这一帧也不带，它就永远出不去。
+    ///
+    /// 后果不是「少一个字段」而是**下游按 0 计费**：new-api 的 Anthropic 解析
+    /// 对 `message_start` 的 `PromptTokens = InputTokens` **无守卫**（0 直接写入），
+    /// 对 `message_delta` 却有 `> 0` 守卫（`to_oai_chat_resp.go:510-519 / 536-553`）——
+    /// 这一帧不带 input，守卫就不会触发，整条请求的 prompt 计费归零。
+    /// 实测（`docs/集成验证/遗留项验证报告_20261012.md` §2）：同一 prompt
+    /// 非流式记 713、流式只记 75，**少收 89.5%**。
+    ///
+    /// 所以这里偏离官方语义、把完整用量压在这一帧上：**兼容性收益远大于语义纯洁性**，
+    /// 且真实 Anthropic 客户端只读 `output_tokens`，多给的字段会被忽略。
+    ///
+    /// 字段口径与 `usage_to_anthropic`（非流式）严格对齐，两条路径不能漂移：
+    /// `input_tokens` 不含缓存命中部分（所以减掉 `cached`），
+    /// 缓存另计 `cache_read_input_tokens` / `cache_creation_input_tokens`。
+    fn final_usage(&self) -> Value {
+        let cached = self
+            .usage
+            .as_ref()
+            .and_then(|usage| usage.pointer("/prompt_tokens_details/cached_tokens"))
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        let mut usage = json!({
+            "input_tokens": (self.input_tokens - cached).max(0),
+            "output_tokens": self.output_tokens(),
+            "cache_read_input_tokens": cached,
+        });
+        // `cache_creation_input_tokens` 只在非流式那条路径上发（上游有才发），
+        // 这里同样「有才带」——没有该字段时补 0 会凭空多出一个语义（「创建了 0 个缓存」
+        // 与「上游没报」不是一回事）。
+        if let Some(created) = self
+            .usage
+            .as_ref()
+            .and_then(|usage| usage.get("cache_creation_input_tokens"))
+            .and_then(Value::as_i64)
+        {
+            if let Some(map) = usage.as_object_mut() {
+                map.insert("cache_creation_input_tokens".to_string(), json!(created));
+            }
+        }
+        usage
     }
 
     fn consume(&mut self, chunk: &Value) -> Vec<bytes::Bytes> {
@@ -1022,6 +1072,9 @@ impl AnthropicStream {
                     "content": [],
                     "stop_reason": Value::Null,
                     "stop_sequence": Value::Null,
+                    // ⚠️ 这一帧是**首帧**，Chat 上游的 usage 还在最后一帧没到，
+                    // 所以 `self.input_tokens` 此刻必然是初值 0 —— 这里是**占位**，
+                    // 真实输入 token 由收尾的 `message_delta` 补齐（见 `final_usage`）。
                     "usage": { "input_tokens": self.input_tokens, "output_tokens": 0 },
                 },
             }),
@@ -1205,5 +1258,125 @@ pub fn responses_error_code(status: u16) -> &'static str {
         429 => "rate_limit_error",
         500..=599 => "server_error",
         _ => "api_error",
+    }
+}
+
+#[cfg(test)]
+mod anthropic_stream_tests {
+    use super::AnthropicStream;
+    use serde_json::Value;
+
+    /// 把帧拼成整段文本（SSE 是文本协议，断言直接看文本更贴近客户端所见）
+    fn text(frames: &[bytes::Bytes]) -> String {
+        frames
+            .iter()
+            .map(|frame| String::from_utf8_lossy(frame).into_owned())
+            .collect()
+    }
+
+    /// 从整段 SSE 文本里挑出某个事件的 `data:` 负载
+    fn payload(sse: &str, event: &str) -> Value {
+        let needle = format!("event: {event}\n");
+        let start = sse.find(&needle).unwrap_or_else(|| panic!("没有 {event} 帧"));
+        let rest = &sse[start..];
+        let data_at = rest.find("data: ").expect("事件后应有 data 行");
+        let line = rest[data_at + 6..].lines().next().expect("data 行应有内容");
+        serde_json::from_str(line).expect("data 行应是 JSON")
+    }
+
+    /// 模拟一次 Chat 流式响应：首帧无 usage，**最后一帧**才带完整 usage。
+    /// 这正是上游的真实形态，也是 `message_start` 只能写 0 占位的原因。
+    fn run_chat_stream(usage_json: &str) -> String {
+        let mut stream = AnthropicStream::new("test-model");
+        let mut frames = Vec::new();
+        for chunk in [
+            r#"data: {"id":"c1","choices":[{"index":0,"delta":{"content":"你好"}}]}"#,
+            &format!(r#"data: {{"id":"c1","choices":[{{"index":0,"delta":{{}},"finish_reason":"stop"}}],"usage":{usage_json}}}"#),
+        ] {
+            frames.extend(stream.push(format!("{chunk}\n\n").as_bytes()));
+        }
+        frames.extend(stream.finish());
+        text(&frames)
+    }
+
+    /// **本用例钉住的是一个真实计费缺陷**（`遗留项验证报告_20261012.md` §2）。
+    ///
+    /// 改前：`message_delta` 只报 `output_tokens`，`input_tokens` 停在
+    /// `message_start` 的 0 占位 —— new-api 的 Anthropic 解析对 `message_start`
+    /// 无守卫、对 `message_delta` 有 `> 0` 守卫，于是整条请求 prompt 计费归零，
+    /// 实测少收 89.5%。
+    #[test]
+    fn message_delta_carries_input_tokens_so_downstream_billing_is_not_zero() {
+        let sse = run_chat_stream(
+            r#"{"prompt_tokens":1177,"completion_tokens":12,"total_tokens":1189,"prompt_tokens_details":{"cached_tokens":1024}}"#,
+        );
+
+        // message_start 是首帧，此刻上游 usage 还没到 —— 只能是 0 占位
+        let start = payload(&sse, "message_start");
+        assert_eq!(start["message"]["usage"]["input_tokens"], 0);
+        assert_eq!(start["message"]["usage"]["output_tokens"], 0);
+
+        // 收尾帧必须把真实用量补上（这是修复的核心）
+        let delta = payload(&sse, "message_delta");
+        assert_eq!(delta["usage"]["output_tokens"], 12);
+        // input_tokens 不含缓存命中部分：1177 - 1024 = 153
+        assert_eq!(delta["usage"]["input_tokens"], 153, "prompt 计费依赖这一项，不能为 0");
+        assert_eq!(delta["usage"]["cache_read_input_tokens"], 1024);
+    }
+
+    /// 口径必须与非流式的 `usage_to_anthropic` 完全一致，两条路径不能漂移
+    #[test]
+    fn final_usage_matches_non_streaming_shape() {
+        let usage = r#"{"prompt_tokens":1177,"completion_tokens":12,"total_tokens":1189,"prompt_tokens_details":{"cached_tokens":1024}}"#;
+        let delta = payload(&run_chat_stream(usage), "message_delta");
+        let non_stream = super::usage_to_anthropic(Some(&serde_json::from_str(usage).unwrap()));
+        for field in ["input_tokens", "output_tokens", "cache_read_input_tokens"] {
+            assert_eq!(delta["usage"][field], non_stream[field], "字段 {field} 与流式不一致");
+        }
+    }
+
+    /// 上游没报 `cache_creation_input_tokens` 时**不能凭空补 0**：
+    /// 「创建了 0 个缓存」与「上游没报这项」不是一回事。
+    #[test]
+    fn cache_creation_only_appears_when_upstream_reports_it() {
+        let without = payload(
+            &run_chat_stream(r#"{"prompt_tokens":10,"completion_tokens":2}"#),
+            "message_delta",
+        );
+        assert!(without["usage"].get("cache_creation_input_tokens").is_none());
+
+        let with = payload(
+            &run_chat_stream(
+                r#"{"prompt_tokens":10,"completion_tokens":2,"cache_creation_input_tokens":7}"#,
+            ),
+            "message_delta",
+        );
+        assert_eq!(with["usage"]["cache_creation_input_tokens"], 7);
+    }
+
+    /// 上游一帧 usage 都没给时，收尾仍要发一帧**合法**的 usage（全 0），
+    /// 不能让下游因为字段缺失而走异常分支
+    #[test]
+    fn final_usage_is_still_emitted_when_upstream_gives_no_usage() {
+        let mut stream = AnthropicStream::new("test-model");
+        let mut frames = stream.push(b"data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n");
+        frames.extend(stream.finish());
+        let delta = payload(&text(&frames), "message_delta");
+        assert_eq!(delta["usage"]["input_tokens"], 0);
+        assert_eq!(delta["usage"]["output_tokens"], 0);
+        assert_eq!(delta["usage"]["cache_read_input_tokens"], 0);
+    }
+
+    /// 缓存量大于 prompt 时不能出现负数（上游字段打架时的兜底）
+    #[test]
+    fn input_tokens_never_goes_negative() {
+        let delta = payload(
+            &run_chat_stream(
+                r#"{"prompt_tokens":100,"completion_tokens":1,"prompt_tokens_details":{"cached_tokens":500}}"#,
+            ),
+            "message_delta",
+        );
+        assert_eq!(delta["usage"]["input_tokens"], 0);
+        assert_eq!(delta["usage"]["cache_read_input_tokens"], 500);
     }
 }
